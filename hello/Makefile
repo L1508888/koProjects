@@ -1,7 +1,8 @@
-# CLANG_PATH := /data/workspace/gki/prebuilts/clang/host/linux-x86/clang-r450784e
-# export PATH := ${CLANG_PATH}/bin:${PATH}
+CLANG_PATH := /home/liuxin/aosp13/prebuilts/clang/host/linux-x86/clang-r450784d
+export PATH := ${CLANG_PATH}/bin:${PATH}
 # export PATH=/data/workspace/gki/prebuilts/clang/host/linux-x86/clang-r450784e/bin:${PATH}
 
+# export PATH=/home/liuxin/aosp13/prebuilts/clang/host/linux-x86/clang-r450784d/bin:$PATH
 
 
 # 如果你的模块位于内核源码树之外，使用这个模板
@@ -14,9 +15,7 @@ obj-m := hello.o
 
 all:
 
-	rm -rf *.ko
-
-	make CC=clang LLVM=1 LLVM_IAS=1  ARCH=arm64 -C ${KER}  M=${PWD} modules
+	make ARCH=arm64 -C ${KER} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1    modules
 	rm -rf *.mod* *.sym* .*.cmd *.order *.o
 # 	make -C $(KDIR) M=$(PWD) modules
 

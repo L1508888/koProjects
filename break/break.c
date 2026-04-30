@@ -1,176 +1,142 @@
-// ftrace_openat_hook.c
-
-#include <linux/ftrace.h>
-#include <linux/init.h>
-#include <linux/kallsyms.h>
-#include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/sched.h>
+#include <linux/kprobes.h>
 #include <linux/uaccess.h>
+#include <linux/hw_breakpoint.h>
+#include <linux/perf_event.h>
+#include <linux/eventfd.h>
+#include <linux/sched.h>
+
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("you");
-MODULE_DESCRIPTION("ftrace hook openat");
 
-// ========================
-// 原始函数指针
-// ========================
-static asmlinkage long (*orig_openat)(int dfd, const char __user *filename,
-                                      int flags, umode_t mode);
+// #define PR_BASE_ID    0x05200000
+// #define PR_REGIS_HW_BP (PR_BASE_ID+1)
+// #define MY_SIG 36
 
-// ========================
-// 我们的hook函数
-// ========================
-static asmlinkage long my_openat(int dfd, const char __user *filename,
-                                 int flags, umode_t mode) {
-  char comm[TASK_COMM_LEN] = {0};
-  char fname[256] = {0};
+// struct my_task {
+//     unsigned int type;
+//     unsigned long address;
+// };
 
-  // 当前进程名
-  get_task_comm(comm, current);
 
-  // 从用户态拷贝路径
-  if (filename) {
-    strncpy_from_user(fname, filename, sizeof(fname) - 1);
-  }
+static struct perf_event *bp;
 
-  // 过滤目标进程
-  if (strcmp(comm, "target_app") == 0) {
+// static void bp_handle(struct perf_event *bp,
+//                       struct perf_sample_data *data,
+//                       struct pt_regs *regs)
+// {
+//     struct kernel_siginfo info;
+//     int signal_info_res;
+//     printk(KERN_ERR "[HWBP] hit pid=%d\n", current->pid);
+//     memset(&info, 0, sizeof(info));
 
-    printk(KERN_INFO "[HOOK] %s openat: %s\n", comm, fname);
+//     info.si_signo = MY_SIG;
+//     info.si_code  = SI_QUEUE;
+//     info.si_ptr = (void*)bp->attr.bp_addr;
+//     signal_info_res = send_sig_info(MY_SIG, &info, current->group_leader);
+//     printk(KERN_ERR "send_sig_info ret %d\n", signal_info_res);
+// }
 
-    // ===== 自定义逻辑 =====
-    if (strstr(fname, "/data/secret")) {
-      printk(KERN_INFO "[HOOK] blocked!\n");
-      return -ENOENT;
+
+
+/* 注册断点 */
+// static int set_bp(pid_t pid, struct my_task *t)
+// {
+//     struct perf_event_attr attr;
+//     struct task_struct *task;
+
+//     task = get_pid_task(find_vpid(pid), PIDTYPE_PID);
+//     if (!task) return -1;
+
+//     hw_breakpoint_init(&attr);
+//     attr.bp_addr = t->address;
+//     attr.bp_len  = HW_BREAKPOINT_LEN_4;
+//     attr.bp_type = HW_BREAKPOINT_X;
+//     attr.exclude_kernel = 1;
+
+
+//     printk("SIGRTMIN = %d, MY_SIG = %d\n", SIGRTMIN, MY_SIG);
+//     bp = register_user_hw_breakpoint(&attr, bp_handle, NULL, task);
+
+//     if (IS_ERR(bp)) {
+//         printk(KERN_ERR "register bp failed\n");
+//         return -1;
+//     }
+
+//     printk(KERN_INFO "set bp addr=%lx\n", t->address);
+//     return 0;
+// }
+
+
+
+
+
+static int handler_pre(struct kprobe *p, struct pt_regs *kregs)
+{
+     struct pt_regs *uregs;
+     int            option;
+     unsigned long  arg2, arg3, arg4, arg5;
+    // struct my_task t;
+    uregs = (struct pt_regs *)kregs->regs[0];
+    if (!uregs){
+        printk("get uregs fail \n");
+        return 0;
+
     }
-  }
+    option = (int)         uregs->regs[0];
+    arg2   = (unsigned long)uregs->regs[1];
+    arg3   = (unsigned long)uregs->regs[2];
+    arg4   = (unsigned long)uregs->regs[3];
+    arg5   = (unsigned long)uregs->regs[4];
 
-  return orig_openat(dfd, filename, flags, mode);
+
+    pr_info("[prctl] pid=%d comm=%s option=0x%x arg2=0x%lx arg3=0x%lx arg4=0x%lx arg5=0x%lx\n",
+            current->pid, current->comm,
+            option, arg2, arg3, arg4, arg5);
+
+    // if (option != PR_REGIS_HW_BP)
+    //     return 0;
+
+    
+
+    // if (copy_from_user(&t, (void __user *)arg2, sizeof(t))) {
+    //     printk(KERN_ERR "copy_from_user failed\n");
+    //     return 0;
+    // }
+    // set_bp(current->pid, &t);
+    return 0;
 }
 
-//
-// ========================
-// ftrace hook 结构体
-// ========================
-struct ftrace_hook {
-  const char *name;
-  void *function;
-  void *original;
 
-  unsigned long address;
-  struct ftrace_ops ops;
-};
+static struct kprobe kp;
 
-//
-// ========================
-// ftrace 回调（关键）
-// ========================
-static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
-                                    struct ftrace_ops *ops,
-                                    struct pt_regs *regs) {
-  struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
 
-#if defined(CONFIG_ARM64)
-  regs->regs[0] = regs->regs[0]; // 保持结构完整（占位）
-  regs->pc = (unsigned long)hook->function;
-#else
-  regs->ip = (unsigned long)hook->function;
-#endif
+static int __init init_mod(void)
+{
+    int ret;
+    kp.symbol_name = "__arm64_sys_prctl";
+    kp.pre_handler = handler_pre;
+
+    ret = register_kprobe(&kp);
+    if (ret < 0) {
+        printk(KERN_ERR "register_kprobe fail %d\n", ret);
+        return ret;
+    }
+
+    printk(KERN_INFO "module loaded\n");
+    return 0;
 }
 
-//
-// ========================
-// 解析符号地址
-// ========================
-static int fh_resolve_hook_address(struct ftrace_hook *hook) {
-  hook->address = kallsyms_lookup_name(hook->name);
 
-  if (!hook->address) {
-    printk(KERN_ERR "unresolved symbol: %s\n", hook->name);
-    return -ENOENT;
-  }
+static void __exit exit_mod(void)
+{
+    if (bp)
+        unregister_hw_breakpoint(bp);
 
-  *((unsigned long *)hook->original) = hook->address;
+    unregister_kprobe(&kp);
 
-  return 0;
+    printk(KERN_INFO "module exit\n");
 }
 
-//
-// ========================
-// 安装 hook
-// ========================
-static int fh_install_hook(struct ftrace_hook *hook) {
-  int err;
-
-  err = fh_resolve_hook_address(hook);
-  if (err)
-    return err;
-
-  hook->ops.func = fh_ftrace_thunk;
-  // hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS
-  //                 | FTRACE_OPS_FL_RECURSION_SAFE
-  //                 | FTRACE_OPS_FL_IPMODIFY;
-
-  hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED |
-                    FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY;
-
-  err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
-  if (err)
-    return err;
-
-  err = register_ftrace_function(&hook->ops);
-  if (err)
-    return err;
-
-  return 0;
-}
-
-//
-// ========================
-// 卸载 hook
-// ========================
-static void fh_remove_hook(struct ftrace_hook *hook) {
-  unregister_ftrace_function(&hook->ops);
-  ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
-}
-
-//
-// ========================
-// 定义 hook
-// ========================
-static struct ftrace_hook openat_hook = {
-    .name = "__arm64_sys_openat",
-    .function = my_openat,
-    .original = &orig_openat,
-};
-
-//
-// ========================
-// 模块入口
-// ========================
-static int __init hook_init(void) {
-  int ret;
-
-  printk(KERN_INFO "openat hook init\n");
-
-  ret = fh_install_hook(&openat_hook);
-  if (ret) {
-    printk(KERN_ERR "hook install failed\n");
-    return ret;
-  }
-
-  return 0;
-}
-
-//
-// ========================
-// 模块退出
-// ========================
-static void __exit hook_exit(void) {
-  fh_remove_hook(&openat_hook);
-  printk(KERN_INFO "openat hook exit\n");
-}
-
-module_init(hook_init);
-module_exit(hook_exit);
+module_init(init_mod);
+module_exit(exit_mod);
