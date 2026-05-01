@@ -18,7 +18,7 @@ modules:
 	rm -rf *.mod* *.sym* .*.cmd *.order *.o
 	
 # 	adb shell 'su echo 0 > /proc/sys/kernel/kptr_restrict'
-	adb push break.ko /data/local/tmp/
+# 	adb push break.ko /data/local/tmp/
 # 	adb shell 'su insmod /data/local/tmp/break.ko'
 # 	adb shell 'su dmesg | tail'
 

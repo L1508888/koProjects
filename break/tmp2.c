@@ -18,12 +18,16 @@ struct my_task {
     unsigned long address;
 };
 
-
+struct bp_reg_work {
+    struct work_struct work;
+    pid_t pid;
+    unsigned long addr;
+};
 
 
 // 这两个静态变量在后续会继续使用
 static struct perf_event *bp;
-
+struct bp_reg_work *bpw;
 
 /* ---------- 硬件断点命中回调 ---------- */
 static void bp_handle(struct perf_event *bp_event,
@@ -31,7 +35,11 @@ static void bp_handle(struct perf_event *bp_event,
                       struct pt_regs *regs)
 {
     struct kernel_siginfo info;
+
     pr_info("break [HWBP] hit pid=%d\n", current->pid);
+
+    /* 1. 立即禁用断点（原子上下文安全），防止重入 */
+    perf_event_disable(bp_event);
 
     /* 2. 发送信号给用户态 */
     memset(&info, 0, sizeof(info));
@@ -41,15 +49,17 @@ static void bp_handle(struct perf_event *bp_event,
     send_sig_info(MY_SIG, &info, current->group_leader);
 }
 
-
-static void set_bp(pid_t pid, unsigned long address)
+/* ---------- 重新注册断点（工作队列，进程上下文）---------- */
+static void bp_reg_work_handler(struct work_struct *w)
 {
+    struct bp_reg_work *bpw = container_of(w, struct bp_reg_work, work);
     struct task_struct *task;
     struct perf_event_attr attr;
 
-    task = get_pid_task(find_vpid(pid), PIDTYPE_PID);
+    task = get_pid_task(find_vpid(bpw->pid), PIDTYPE_PID);
     if (!task) {
-        pr_err("break: target task %d not found\n", pid);
+        pr_err("break: target task %d not found\n", bpw->pid);
+        kfree(bpw);   /* ✅ 修复内存泄漏 */
         return;
     }
 
@@ -61,7 +71,7 @@ static void set_bp(pid_t pid, unsigned long address)
 
     /* 创建新断点 */
     hw_breakpoint_init(&attr);
-    attr.bp_addr = address;
+    attr.bp_addr = bpw->addr;
     attr.bp_len  = HW_BREAKPOINT_LEN_4;
     attr.bp_type = HW_BREAKPOINT_X;
     attr.exclude_kernel = 1;
@@ -71,10 +81,11 @@ static void set_bp(pid_t pid, unsigned long address)
         pr_err("break: register_user_hw_breakpoint failed\n");
         bp = NULL;
     } else {
-        pr_info("break: bp re-registered for task %d at 0x%lx\n", pid, address);
+        pr_info("break: bp re-registered for task %d at 0x%lx\n", bpw->pid, bpw->addr);
     }
 
     put_task_struct(task);
+    kfree(bpw);
 }
 
 /* ---------- kprobe 回调 ---------- */
@@ -106,7 +117,15 @@ static int handler_pre(struct kprobe *p, struct pt_regs *kregs)
             pr_err("break: copy_from_user failed\n");
             return 0;
         }
-        set_bp(current->pid, t.address);
+
+        bpw = kmalloc(sizeof(*bpw), GFP_ATOMIC);
+        if (!bpw)
+            return 0;
+
+        bpw->pid  = current->pid;
+        bpw->addr = t.address;
+        INIT_WORK(&bpw->work, bp_reg_work_handler);
+        schedule_work(&bpw->work);
     }
     return 0;
 }
