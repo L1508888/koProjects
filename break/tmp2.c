@@ -14,20 +14,18 @@ MODULE_LICENSE("GPL");
 #define MY_SIG          36
 
 struct my_task {
+    unsigned int pid;
     unsigned int type;
     unsigned long address;
+
 };
 
-struct bp_reg_work {
-    struct work_struct work;
-    pid_t pid;
-    unsigned long addr;
-};
+
 
 
 // 这两个静态变量在后续会继续使用
 static struct perf_event *bp;
-struct bp_reg_work *bpw;
+static struct my_task target_task;
 
 /* ---------- 硬件断点命中回调 ---------- */
 static void bp_handle(struct perf_event *bp_event,
@@ -36,42 +34,38 @@ static void bp_handle(struct perf_event *bp_event,
 {
     struct kernel_siginfo info;
 
-    pr_info("break [HWBP] hit pid=%d\n", current->pid);
-
-    /* 1. 立即禁用断点（原子上下文安全），防止重入 */
-    perf_event_disable(bp_event);
-
+    /* 先安全卸载旧断点（此时已经在进程上下文） */
+    if (bp) {
+        unregister_hw_breakpoint(bp);
+        bp = NULL;
+    }
+    
     /* 2. 发送信号给用户态 */
     memset(&info, 0, sizeof(info));
     info.si_signo = MY_SIG;
     info.si_code  = SI_QUEUE;
     info.si_ptr   = (void *)bp_event->attr.bp_addr;
     send_sig_info(MY_SIG, &info, current->group_leader);
+    
 }
 
-/* ---------- 重新注册断点（工作队列，进程上下文）---------- */
-static void bp_reg_work_handler(struct work_struct *w)
+
+static void set_bp(struct my_task* target_task)
 {
-    struct bp_reg_work *bpw = container_of(w, struct bp_reg_work, work);
     struct task_struct *task;
     struct perf_event_attr attr;
-
-    task = get_pid_task(find_vpid(bpw->pid), PIDTYPE_PID);
+    
+    pr_info("break prepare install breakpoint at %lx \n", target_task->address);
+    task = get_pid_task(find_vpid(target_task->pid), PIDTYPE_PID);
     if (!task) {
-        pr_err("break: target task %d not found\n", bpw->pid);
-        kfree(bpw);   /* ✅ 修复内存泄漏 */
+        pr_err("break: target task %d not found\n", target_task->pid);
         return;
     }
 
-    /* 先安全卸载旧断点（此时已经在进程上下文） */
-    if (bp) {
-        unregister_hw_breakpoint(bp);
-        bp = NULL;
-    }
-
+    
     /* 创建新断点 */
     hw_breakpoint_init(&attr);
-    attr.bp_addr = bpw->addr;
+    attr.bp_addr = target_task->address;
     attr.bp_len  = HW_BREAKPOINT_LEN_4;
     attr.bp_type = HW_BREAKPOINT_X;
     attr.exclude_kernel = 1;
@@ -81,11 +75,10 @@ static void bp_reg_work_handler(struct work_struct *w)
         pr_err("break: register_user_hw_breakpoint failed\n");
         bp = NULL;
     } else {
-        pr_info("break: bp re-registered for task %d at 0x%lx\n", bpw->pid, bpw->addr);
+        pr_info("break: bp re-registered for task %d at 0x%lx\n", target_task->pid, target_task->address);
     }
 
     put_task_struct(task);
-    kfree(bpw);
 }
 
 /* ---------- kprobe 回调 ---------- */
@@ -94,9 +87,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *kregs)
     struct pt_regs *uregs;
     int option;
     unsigned long arg2, arg3, arg4, arg5;
-    struct my_task t;
     
-
     uregs = (struct pt_regs *)kregs->regs[0];
     if (!uregs) {
         pr_err("break: get uregs failed\n");
@@ -113,19 +104,12 @@ static int handler_pre(struct kprobe *p, struct pt_regs *kregs)
         pr_info("break: prctl pid=%d comm=%s option=0x%x arg2=0x%lx\n",
                 current->pid, current->comm, option, arg2);
 
-        if (copy_from_user(&t, (void __user *)arg2, sizeof(t))) {
+        if (copy_from_user(&target_task, (void __user *)arg2, sizeof(target_task))) {
             pr_err("break: copy_from_user failed\n");
             return 0;
         }
-
-        bpw = kmalloc(sizeof(*bpw), GFP_ATOMIC);
-        if (!bpw)
-            return 0;
-
-        bpw->pid  = current->pid;
-        bpw->addr = t.address;
-        INIT_WORK(&bpw->work, bp_reg_work_handler);
-        schedule_work(&bpw->work);
+        target_task.pid = current->pid;
+        set_bp(&target_task);
     }
     return 0;
 }

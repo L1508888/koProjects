@@ -1,5 +1,5 @@
 
-CLANG_PATH := /home/liuxin/aosp13/prebuilts/clang/host/linux-x86/clang-r450784d
+CLANG_PATH := /home/liuxin/pixelKernel/prebuilts/clang/host/linux-x86/clang-r450784e
 export PATH := ${CLANG_PATH}/bin:${PATH}
 
 
@@ -8,13 +8,14 @@ export PATH := ${CLANG_PATH}/bin:${PATH}
 # 如果你的模块位于内核源码树之外，使用这个模板
 # 将 KERNEL_DIR 指向你之前编译过的内核源码路径
 KER := /home/liuxin/pixelKernel/common
+MOR := /home/liuxin/pixelKernel/out/android13-5.10/common
 # KER := /home/liuxin/gitProjects/pixelKernel/private/gs-google/include
 obj-m := break.o
 
 
 modules:
 # 	rm -rf *.ko
-	make ARCH=arm64 -C ${KER} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1 modules
+	make ARCH=arm64 -C ${KER} O=${MOR} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1 modules
 	rm -rf *.mod* *.sym* .*.cmd *.order *.o
 	
 # 	adb shell 'su echo 0 > /proc/sys/kernel/kptr_restrict'
