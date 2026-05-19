@@ -15,8 +15,7 @@ obj-m := break.o
 
 modules:
 # 	rm -rf *.ko
-	# make ARCH=arm64 -C ${KER} O=${MOR} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1 modules
-	make ARCH=arm64 -C ${KER} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1 modules
+	make ARCH=arm64 -C ${KER} O=${MOR} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1 modules
 	rm -rf *.mod* *.sym* .*.cmd *.order *.o
 	
 # 	adb shell 'su echo 0 > /proc/sys/kernel/kptr_restrict'
