@@ -16,7 +16,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/smp.h>
 #include <linux/printk.h>
-#include <linux/workqueue.h>
+#include <linux/task_work.h>
 #include <linux/ktime.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -179,11 +179,15 @@ typedef struct perf_event * __percpu *
                                              perf_overflow_handler_t triggered,
                                              void *context);
 typedef void (*unregister_wide_hw_breakpoint_t)(struct perf_event * __percpu *cpu_events);
+typedef int  (*task_work_add_t)(struct task_struct *task,
+                                struct callback_head *twork,
+                                enum task_work_notify_mode mode);
 
 static toggle_bp_registers_t         p_toggle_bp_registers;
 static user_enable_single_step_t     p_user_enable_single_step;
 static register_wide_hw_breakpoint_t  p_register_wide_hw_breakpoint;
 static unregister_wide_hw_breakpoint_t p_unregister_wide_hw_breakpoint;
+static task_work_add_t               p_task_work_add;
 
 
 static unsigned long lookup_via_kprobe(const char *name)
@@ -219,14 +223,18 @@ static int __nocfi resolve_kernel_symbols(void)
         (register_wide_hw_breakpoint_t)kln("register_wide_hw_breakpoint");
     p_unregister_wide_hw_breakpoint =
         (unregister_wide_hw_breakpoint_t)kln("unregister_wide_hw_breakpoint");
+    p_task_work_add =
+        (task_work_add_t)kln("task_work_add");
 
     if (!p_toggle_bp_registers || !p_user_enable_single_step ||
-        !p_register_wide_hw_breakpoint || !p_unregister_wide_hw_breakpoint) {
+        !p_register_wide_hw_breakpoint || !p_unregister_wide_hw_breakpoint ||
+        !p_task_work_add) {
         pr_err("break: missing symbols toggle_bp_registers=%px "
                "user_enable_single_step=%px register_wide_hw_breakpoint=%px "
-               "unregister_wide_hw_breakpoint=%px\n",
+               "unregister_wide_hw_breakpoint=%px task_work_add=%px\n",
                p_toggle_bp_registers, p_user_enable_single_step,
-               p_register_wide_hw_breakpoint, p_unregister_wide_hw_breakpoint);
+               p_register_wide_hw_breakpoint, p_unregister_wide_hw_breakpoint,
+               p_task_work_add);
         return -ENOENT;
     }
     return 0;
@@ -319,40 +327,31 @@ static void __nocfi release_bp(void)
 }
 
 
-/* ---------- 在内核线程上下文里真正去注册硬件断点 ---------- *
+/* ---------- 在进程上下文里真正去注册硬件断点 ---------- *
  *
- * 走 workqueue 而不是 task_work，原因有二：
+ * 仍然走 task_work：kprobe pre-handler 是原子上下文（IRQ disabled），而
+ * register_wide_hw_breakpoint 会 sleep（要在所有 CPU 上做 IPI/install），
+ * 不能直接在那里跑。
  *
- *   1. kprobe pre-handler 是原子上下文（IRQ disabled），而
- *      register_wide_hw_breakpoint 会 sleep（要在所有 CPU 上做 IPI/install），
- *      不能直接在那里跑，必须挪到可调度上下文。
- *
- *   2. register_wide_hw_breakpoint 注册的是 CPU-scoped perf_event，
- *      find_get_context() 对 CPU 维度 event 会强制 perf_allow_cpu() 检查：
- *      perf_event_paranoid > 0 且 !capable(CAP_PERFMON) 直接返回 -EACCES。
- *      task_work 跑在「调用 prctl 的那个无特权用户进程」上下文里，capable()
- *      用的是它的 cred，必然失败。改用 workqueue 后回调跑在内核 worker
- *      线程（init_cred）上下文，capable(CAP_PERFMON) 为真，直接放行。
- *
- * 用 alloc_ordered_workqueue 建的有序队列，保证 install/uninstall 串行执行，
- * 不会有两个请求并发改 cpu_bp_events。
+ * task_work_add(current, ..., TWA_RESUME) 把回调挂到调用线程的
+ * TIF_NOTIFY_RESUME 链上，prctl 系统调用返回用户态前在「调用线程自己」
+ * 可调度的上下文里执行。
  */
-static struct workqueue_struct *bp_wq;
-
 struct bp_request {
-    struct work_struct work;
-    struct my_task     t;
+    struct callback_head cbh;
+    struct my_task       t;
 };
 
-static void __nocfi bp_install_work(struct work_struct *work)
+static void __nocfi bp_install_twork(struct callback_head *head)
 {
-    struct bp_request *req = container_of(work, struct bp_request, work);
+    struct bp_request *req = container_of(head, struct bp_request, cbh);
     struct my_task t = req->t;
     struct perf_event_attr attr;
     struct perf_event * __percpu *evs;
 
-    pr_info("break: install (work): type=%u addr=0x%lx target_tgid=%d\n",
-            t.type, t.address, t.pid);
+    pr_info("break: install (twork): caller_tgid=%d caller_tid=%d "
+            "type=%u addr=0x%lx target_tgid=%d\n",
+            current->tgid, current->pid, t.type, t.address, t.pid);
 
     /* uninstall：address == 0 时卸掉当前 BP */
     if (t.address == 0) {
@@ -393,14 +392,16 @@ out_free:
 }
 
 
-/* ---------- kprobe 回调：只采集数据，挂 workqueue ----------
+/* ---------- kprobe 回调：只采集数据，挂 task_work ----------
  *
- * kprobe pre handler 是原子上下文（IRQ disabled），只做 copy_from_user +
- * 入队，真正会 sleep 的注册动作丢给 bp_wq 的 worker 线程跑。 */
-static int handler_pre(struct kprobe *p, struct pt_regs *kregs)
+ * 必须标 __nocfi：内部要通过 kallsyms 解析出来的函数指针 p_task_work_add()
+ * 做间接调用，CFI hash 对不上会 BUG()/panic，且发生在 atomic 上下文里
+ * （kprobe pre handler IRQ disabled），日志根本来不及刷，表现就是"机器
+ *  瞬间没了"。 */
+static int __nocfi handler_pre(struct kprobe *p, struct pt_regs *kregs)
 {
     struct pt_regs *uregs;
-    int option;
+    int option, ret;
     unsigned long arg2;
     struct bp_request *req;
     struct my_task t;
@@ -431,11 +432,13 @@ static int handler_pre(struct kprobe *p, struct pt_regs *kregs)
         return 0;
 
     req->t = t;
-    INIT_WORK(&req->work, bp_install_work);
+    init_task_work(&req->cbh, bp_install_twork);
 
-    if (!queue_work(bp_wq, &req->work)) {
-        pr_err("break: queue_work failed (tgid=%d tid=%d), req already queued\n",
-               current->tgid, current->pid);
+    /* TWA_RESUME：仅在返回用户态时唤醒，不会中断当前系统调用语义 */
+    ret = p_task_work_add(current, &req->cbh, TWA_RESUME);
+    if (ret) {
+        pr_err("break: task_work_add(tgid=%d tid=%d) failed: %d\n",
+               current->tgid, current->pid, ret);
         kfree(req);
     }
 
@@ -451,19 +454,11 @@ static int __init init_mod(void)
     if (ret)
         return ret;
 
-    /* 有序队列：保证 install/uninstall 请求按提交顺序串行执行 */
-    bp_wq = alloc_ordered_workqueue("break_bp_wq", 0);
-    if (!bp_wq) {
-        pr_err("break: alloc_ordered_workqueue failed\n");
-        return -ENOMEM;
-    }
-
     kp.symbol_name = "__arm64_sys_prctl";
     kp.pre_handler = handler_pre;
     ret = register_kprobe(&kp);
     if (ret < 0) {
         pr_err("break: register_kprobe(__arm64_sys_prctl) failed %d\n", ret);
-        destroy_workqueue(bp_wq);
         return ret;
     }
 
@@ -473,13 +468,8 @@ static int __init init_mod(void)
 
 static void __nocfi __exit exit_mod(void)
 {
-    /* 先摘 kprobe，确保不再有新的 req 入队；
-     * 再 flush 把队列里在途的 install/uninstall 跑完，避免 release_bp 之后
-     * 还有 worker 引用已释放的资源；最后销毁队列。 */
     unregister_kprobe(&kp);
-    flush_workqueue(bp_wq);
     release_bp();
-    destroy_workqueue(bp_wq);
     pr_info("break: module exit\n");
 }
 
