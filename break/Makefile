@@ -10,6 +10,18 @@ export PATH := ${CLANG_PATH}/bin:${PATH}
 KER := /home/liuxin/pixelKernel/common
 MOR := /home/liuxin/pixelKernel/out/android13-5.10/common
 # KER := /home/liuxin/gitProjects/pixelKernel/private/gs-google/include
+
+
+
+
+
+## 为redmi 设备编译内核模块
+# CLANG_PATH := /home/liuxin/aosp_clang/bin
+# export PATH := ${CLANG_PATH}/bin:${PATH}
+# KERNEL_DIR := /home/liuxin/skyKernel/gki-common/out
+
+
+
 obj-m := break.o
 
 
