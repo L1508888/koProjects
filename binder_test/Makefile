@@ -1,5 +1,3 @@
-
-
 CLANG_PATH := /home/liuxin/pixelKernel/prebuilts/clang/host/linux-x86/clang-r450784e
 export PATH := ${CLANG_PATH}/bin:${PATH}
 
@@ -8,19 +6,12 @@ export PATH := ${CLANG_PATH}/bin:${PATH}
 KER := /home/liuxin/pixelKernel/common
 MOR := /home/liuxin/pixelKernel/out/android13-5.10/common
 
-obj-m := pte_main.o
 
-# 组成 pte_test.ko 的各个 .o（可继续追加）
-pte_main-objs := pte_test.o anti/break.o
-
-
-ccflags-y=-mgeneral-regs-only
+obj-m := binder_test.o
 
 modules:
 	make ARCH=arm64 -C ${KER} O=${MOR} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1 modules
-	find . -type f \( -name '*.mod' -o -name '*.mod.c' -o -name '*.mod.o' \
-	                -o -name '*.symvers' -o -name '*.order' \
-	                -o -name '*.o' -o -name '.*.cmd' \) -delete
+	rm -rf *.mod* *.sym* .*.cmd *.order *.o
 	
 clean:
 	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) clean
