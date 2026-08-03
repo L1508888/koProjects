@@ -56,7 +56,102 @@ static int clear_pte_cb(pte_t *pte, unsigned long addr, void *data) {
   return 0;
 }
 
-int ghost_alloc(struct task_struct *task, struct mm_struct *mm,
+
+
+/**
+ *
+ * @param mm                目标进程的内存描述符（mm_struct），描述该进程整个地址空间。
+ * @param near              期望分配位置的“中心”地址。函数会尽量在这个地址附近找到空洞。
+ * @param range             搜索范围，以 near 为基准，上下各 range 字节。
+ * 最终搜索区间为 [near_page - range, near_page + range)，其中 near_page = near & ~0xFFF（页对齐）
+ * @param num_pages         需要分配的页面数量
+ * @return                  找到的起始地址（页对齐），未找到则返回 0
+ */
+static __nocfi unsigned long find_hole_near(struct mm_struct *mm,
+                                            unsigned long near,
+                                            unsigned long range,
+                                            int num_pages)
+{
+    // 需要的总字节数
+    unsigned long need = (unsigned long)num_pages * 0x1000;
+    unsigned long near_page = near & ~0xFFFUL;                  // near 向下页对齐
+//      一般来说 near_page 是一个地址，range 是一个范围，在这个样本中，这个范围为16MB，地址是肯定大于范围的
+//      所以lower 表示的是寻找范围的下限,high 表示的是寻找范围的上限
+    unsigned long lower = near_page > range ? near_page - range : 0;
+    unsigned long high = near_page + range;
+
+    unsigned long best = 0, best_dist = ~0UL;
+
+    unsigned long addr = lower;
+    struct vma_head *vma;
+
+    if (!g_syms.find_vma){
+        return 0;
+    }
+    if (num_pages <= 0){
+        return 0;
+    }
+
+    while (addr < high) {
+        unsigned long gap_start, gap_end, cand, d;
+
+        //      寻找第一个满足 vm_end > addr 的 VMA
+        vma = (struct vma_head *)g_syms.find_vma(mm, addr);
+
+        /*
+         * 如果 VMA 为null 表示没有一个 VMA 的 vm_end 大于 addr，也就是说 所有 VMA 的 vm_end 都是小于 addr的，
+         * 所以 从addr 到 high 就是一个空洞
+         *
+         * 如果找到一个 VMA 同时 这个VMA 的 vm_start 大于 high ，表示从 addr 到 high 这段区域是空洞
+         */
+        if (!vma || vma->vm_start >= high) {
+            gap_start = addr;
+            gap_end = high;
+        }
+        /*
+         * 如果 VMS 的 vm_start 大于 addr ，说明这个 VMA 和 addr 之间存在一个空洞，这个范围还需要确认
+         */
+        else if (vma->vm_start > addr) {
+            gap_start = addr;
+            gap_end = vma->vm_start;
+        }
+        /*
+         *  说明addr 在某一个VMA 的内部，重新设定范围
+         */
+        else {
+            addr = vma->vm_end;
+            continue;
+        }
+
+//        找到空洞之后再进行处理
+        if (gap_end - gap_start >= need) {
+           //   如果找到的空洞包含 near_page
+            if (near_page >= gap_start && near_page + need <= gap_end)
+                cand = near_page;
+            //  找到的空洞在 near_page 的更高地址
+            else if (near_page < gap_start)
+                cand = gap_start;
+            //  找到的空洞在 near_page 的更低地址
+            else
+                cand = gap_end - need;
+
+            d = (cand > near_page) ? cand - near_page : near_page - cand;
+            if (d < best_dist && !vaddr_is_occupied(mm, cand)) {
+                best_dist = d;
+                best = cand;
+            }
+        }
+
+        if (!vma || vma->vm_start >= high){
+            break;
+        }
+        addr = vma->vm_end;
+    }
+    return best;
+}
+
+
+int __nocfi ghost_alloc(struct task_struct *task, struct mm_struct *mm,
                 unsigned long near, unsigned long range, uint64_t pte_template,
                 int num_pages, GhostMemoryData *out) {
 
@@ -144,7 +239,7 @@ int ghost_alloc(struct task_struct *task, struct mm_struct *mm,
   return 0;
 }
 
-int ghost_free(GhostMemoryData *ghostMemory) {
+int __nocfi ghost_free(GhostMemoryData *ghostMemory) {
   int page_count, i;
   uint64_t asid;
   if (!ghostMemory || !ghostMemory->installed) {

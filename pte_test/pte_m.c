@@ -16,20 +16,13 @@
 #define __nocfi __attribute__((__no_sanitize__("cfi")))
 #endif
 
-#define MAGIC_PRCTL_OPTION  0xDEADBEEF
 
-typedef struct {
-	unsigned long address;
-	pid_t         pid;
-} HookTask;
 
-typedef int (*follow_pte_t)(struct mm_struct *mm, unsigned long address,
-			    pte_t **ptepp, spinlock_t **ptlp);
-typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+
 
 static follow_pte_t follow_pte_ptr;
-static struct kprobe kp;
-static struct kprobe mem_abort_kp;
+
+
 
 /* ---------- hook 目标 ---------- */
 static pid_t         g_hook_pid;
@@ -59,51 +52,9 @@ static inline pte_t pte_clear_uxn(pte_t pte)
 	return pte;
 }
 
-static unsigned long lookup_via_kprobe(const char *name)
-{
-	struct kprobe k;
-	unsigned long addr = 0;
 
-	memset(&k, 0, sizeof(k));
-	k.symbol_name = name;
-	if (register_kprobe(&k) == 0) {
-		addr = (unsigned long)k.addr;
-		unregister_kprobe(&k);
-	}
-	return addr;
-}
 
-static __nocfi int resolve_kernel_symbols(void)
-{
-	kallsyms_lookup_name_t kln;
-	unsigned long addr = lookup_via_kprobe("kallsyms_lookup_name");
 
-	if (!addr) {
-		pr_err("pte_test: cannot resolve kallsyms_lookup_name\n");
-		return -ENOENT;
-	}
-	kln = (kallsyms_lookup_name_t)addr;
-
-	follow_pte_ptr = (follow_pte_t)kln("follow_pte");
-	if (!follow_pte_ptr) {
-		pr_err("pte_test: follow_pte not found\n");
-		return -ENOENT;
-	}
-	pr_info("pte_test: follow_pte=%px\n", follow_pte_ptr);
-	return 0;
-}
-
-static __nocfi struct task_struct *get_task_by_pid(pid_t pid)
-{
-	struct task_struct *task = NULL;
-
-	rcu_read_lock();
-	task = find_task_by_vpid(pid);
-	if (task)
-		get_task_struct(task);
-	rcu_read_unlock();
-	return task;
-}
 
 /*
  * 在 abort / kprobe 上下文里清 UXN：
@@ -287,42 +238,16 @@ static __nocfi int ptehook_handle_abort(unsigned long far, unsigned long esr,
 }
 
 
-static int mem_abort_pre(struct kprobe *p, struct pt_regs *regs)
-{
-	unsigned long far = regs->regs[0];
-	unsigned long esr = regs->regs[1];
-	/* do_mem_abort 的第 3 个参数：用户态 pt_regs* */
-	struct pt_regs *uregs = (struct pt_regs *)regs->regs[2];
 
-	ptehook_handle_abort(far, esr, uregs);
-	return 0; /* 永不改 pc，永不跳过原函数 */
-}
-
-static int install_mem_abort_hook(void)
-{
-	int ret;
-
-	memset(&mem_abort_kp, 0, sizeof(mem_abort_kp));
-	mem_abort_kp.symbol_name = "do_mem_abort";
-	mem_abort_kp.pre_handler = mem_abort_pre;
-	ret = register_kprobe(&mem_abort_kp);
-	if (ret < 0) {
-		pr_err("pte_test: register_kprobe(do_mem_abort) failed %d\n", ret);
-		return ret;
-	}
-	pr_info("pte_test: do_mem_abort hooked\n");
-	return 0;
-}
-
+/**
+	修改指定地址所在虚拟地址的 PTE 值
+*/
 int __nocfi modify_process_pte(HookTask *hooktask)
 {
 	struct task_struct *task;
 	struct mm_struct *mm;
 	unsigned long va = strip_user_tag(hooktask->address);
 	int ret;
-
-	// pr_info("pte_test: pid=%d addr=0x%lx page=0x%lx\n",
-	// 	hooktask->pid, va, page_of(va));
 
 	task = get_task_by_pid(hooktask->pid);
 	if (!task) {
@@ -356,70 +281,37 @@ int __nocfi modify_process_pte(HookTask *hooktask)
 	return 0;
 }
 
-static __nocfi int handler_pre(struct kprobe *p, struct pt_regs *kregs)
+
+
+static int mem_abort_pre(struct kprobe *p, struct pt_regs *regs)
 {
-	struct pt_regs *uregs;
-	unsigned long arg2, left;
-	HookTask myTask;
-	int option;
+	unsigned long far = regs->regs[0];
+	unsigned long esr = regs->regs[1];
+	/* do_mem_abort 的第 3 个参数：用户态 pt_regs* */
+	struct pt_regs *uregs = (struct pt_regs *)regs->regs[2];
 
-	uregs = (struct pt_regs *)kregs->regs[0];
-	if (!uregs)
-		return 0;
-
-	option = (int)uregs->regs[0];
-	if (option != MAGIC_PRCTL_OPTION)
-		return 0;
-
-	arg2 = (unsigned long)uregs->regs[1];
-	if (!arg2)
-		return 0;
-
-	left = copy_from_user(&myTask, (void __user *)arg2, sizeof(myTask));
-	if (left) {
-		pr_err("pte_test: copy_from_user failed, %lu left\n", left);
-		return 0;
-	}
-
-	modify_process_pte(&myTask);
-	return 0;
+	ptehook_handle_abort(far, esr, uregs);
+	return 0; /* 永不改 pc，永不跳过原函数 */
 }
 
-static int __init init_mod(void)
+
+
+//	用于hook do_mem_abort 函数
+static struct kprobe mem_abort_kp;
+static int install_mem_abort_hook(void)
 {
 	int ret;
 
-	ret = resolve_kernel_symbols();
-	if (ret)
-		return ret;
-
-	kp.symbol_name = "__arm64_sys_prctl";
-	kp.pre_handler = handler_pre;
-	ret = register_kprobe(&kp);
+	memset(&mem_abort_kp, 0, sizeof(mem_abort_kp));
+	mem_abort_kp.symbol_name = "do_mem_abort";
+	mem_abort_kp.pre_handler = mem_abort_pre;
+	ret = register_kprobe(&mem_abort_kp);
 	if (ret < 0) {
-		pr_err("pte_test: register_kprobe(prctl) failed %d\n", ret);
+		pr_err("pte_test: register_kprobe(do_mem_abort) failed %d\n", ret);
 		return ret;
 	}
-
-	ret = install_mem_abort_hook();
-	if (ret) {
-		unregister_kprobe(&kp);
-		return ret;
-	}
-	install_hook_ptrace();
-	pr_info("pte_test: module loaded\n");
+	pr_info("pte_test: do_mem_abort hooked\n");
 	return 0;
 }
 
-static void __exit exit_mod(void)
-{
-	g_hook_armed = false;
-	unregister_kprobe(&mem_abort_kp);
-	unregister_kprobe(&kp);
-	uninstall_hook_ptrace();
-	pr_info("pte_test: module exit\n");
-}
 
-MODULE_LICENSE("GPL");
-module_init(init_mod);
-module_exit(exit_mod);
