@@ -11,6 +11,8 @@
 #include <asm/ptrace.h>
 
 
+#include "break_pass.h"
+
 #ifndef __nocfi
 #define __nocfi __attribute__((__no_sanitize__("cfi")))
 #endif
@@ -31,11 +33,10 @@
 #define HW_MAX   16
 
 
-static struct kretprobe ptrace_kp;
 
 #define HW_DBG_REGS_MAX 16
-static LIST_HEAD(bp_list);
-static DEFINE_SPINLOCK(bp_lock);
+// static LIST_HEAD(bp_list);
+// static DEFINE_SPINLOCK(bp_lock);
 
 
 /* 与 uapi asm/ptrace.h::user_hwdebug_state 一致 */

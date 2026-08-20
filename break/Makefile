@@ -25,6 +25,9 @@ MOR := /home/liuxin/pixelKernel/out/android13-5.10/common
 obj-m := break.o
 
 
+ccflags-y=-mgeneral-regs-only
+
+
 modules:
 # 	rm -rf *.ko
 	make ARCH=arm64 -C ${KER} O=${MOR} M=${PWD} CC=clang LLVM=1 LLVM_IAS=1 modules

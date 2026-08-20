@@ -23,21 +23,16 @@
 #include <linux/kernel.h>
 #include "dbi.h"
 
-/* ---------- Small helpers (no libc) ---------- */
-
-// static int64_t sign_extend64(uint64_t val, int bits)
-// {
-//     int64_t mask = 1LL << (bits - 1);
-//     return (int64_t)((val ^ mask) - mask);
-// }
-#include <linux/module.h>
 
 
-MODULE_LICENSE("GPL");                 // 许可证声明，例如 "GPL"、"GPL v2" 或 "Dual BSD/GPL"
-MODULE_AUTHOR("liuxin");                // 作者（可选）
-MODULE_DESCRIPTION("ptehook test");     // 描述（可选）
+// /* 把 bits 位的无符号数按符号位扩展成 64 位有符号数 */
+static int64_t dbi_sext(uint64_t val, int bits)
+{
+    int64_t mask = 1LL << (bits - 1);
+    return (int64_t)((val ^ mask) - mask);
+}
 
-
+/* 判断有符号数 v 能否用 bits 位补码表示 */
 static __maybe_unused int in_range_s(int64_t v, int bits)
 {
     int64_t lim = 1LL << (bits - 1);
@@ -151,8 +146,8 @@ static uint32_t enc_ldr_vec_imm_unsigned(uint32_t rt, uint32_t rn,
 }
 
 /*
- * Emit MOVZ + up to 3 MOVK for arbitrary 64-bit immediate.
- * Returns number of words written, or negative on error.
+ * 为任意 64 位立即数生成 MOVZ + 最多 3 条 MOVK 序列。
+ * 返回写入的指令条数，失败返回负数。
  */
 static int emit_mov_imm64(uint32_t rd, uint64_t imm, uint32_t *out, int max_insns)
 {
@@ -212,12 +207,12 @@ static uint64_t ghost_cur_pc(const struct dbi_page_ctx *ctx)
 }
 
 /*
- * Emit a 5-instruction far-jump sequence (or shorter if imm has zero chunks):
+ * 生成远跳转序列（立即数含 0 段时会更短）：
  *   MOVZ X17, #imm0
  *   MOVK X17, #imm1, lsl #16
  *   MOVK X17, #imm2, lsl #32
  *   MOVK X17, #imm3, lsl #48
- *   BR X17                       ; far unconditional jump
+ *   BR  X17                       ; 无条件远跳
  */
 static int emit_far_jump(struct dbi_page_ctx *ctx, uint64_t target)
 {
@@ -231,7 +226,7 @@ static int emit_far_jump(struct dbi_page_ctx *ctx, uint64_t target)
     return emit(ctx, enc_br(DBI_SCRATCH_REG));
 }
 
-/* Emit MOVZ/MOVK sequence to load an absolute 64-bit value into rd */
+/* 生成 MOVZ/MOVK 序列，把 64 位绝对地址加载到 rd */
 static int emit_load_addr(struct dbi_page_ctx *ctx, uint32_t rd, uint64_t addr)
 {
     uint32_t movs[4];
@@ -244,28 +239,27 @@ static int emit_load_addr(struct dbi_page_ctx *ctx, uint32_t rd, uint64_t addr)
     return 0;
 }
 
-/* ---------- Intra-page branch resolver ----------
+/* ---------- 页内分支处理 ----------
  *
- * When a conditional branch (CBZ/B.cond/TBZ) or a direct branch (B/BL)
- * targets an address on the SAME hooked page, we should jump to the GHOST
- * equivalent of that address rather than the original VA. Two reasons:
+ * 当条件跳转（CBZ/B.cond/TBZ）或直接跳转（B/BL）的目标地址仍在
+ * 同一个被 hook 的页内时，必须跳到该地址的 ghost 对应位置，而不是
+ * 原始虚拟地址。两个原因：
  *
- *  1) No UXN bounce. Jumping to original VA would trigger the fault handler
- *     again; Pass 3 redirects to ghost anyway. Saves one fault round-trip.
+ *  1) 避免 UXN 空转。跳回原地址会再次触发 fault，最后还是要
+ *     重定向到 ghost，白白多一次异常往返。
  *
- *  2) **Correctness** for out-of-range conditional branches. Our current
- *     expansion for out-of-range CBZ is (inverted-cbz skip; MOV X17,target;
- *     BR X17). That clobbers X17. But ART trampolines (e.g., imt_conflict)
- *     pass meaningful state in X17 (the IMT key), so clobbering it breaks
- *     downstream `mov x0, x17` semantics, causing artInvokeInterface crash.
- *     Intra-page jumps via ghost VA are always in range (ghost ≤ 32KB ≪
- *     1MB CBZ range), so no expansion needed → no reg clobber.
+ *  2) 超范围条件跳转的正确性。目前对超范围 CBZ 的展开是
+ *     （条件取反跳过；MOV X17, 目标；BR X17），这会破坏 X17。
+ *     但 ART 的跳板（如 imt_conflict）会在 X17 里携带 IMT key，
+ *     破坏它会导致后续 `mov x0, x17` 语义出错，引发
+ *     artInvokeInterface 崩溃。页内跳 ghost 地址永远落在
+ *     跳转范围内（ghost ≤ 32KB ≪ 1MB CBZ 范围），无需展开，
+ *     也就不会破坏寄存器。
  *
- * Forward refs: offset_map[target_tidx] isn't filled yet at emit time.
- * We emit a placeholder and queue a pending_branch for post-pass patch.
- * Backward refs: offset_map is already filled, emit directly.
+ * 高地址引用：发射占位指令时 offset_map[target_tidx] 还没填，
+ * 放入 pending 队列等主循环结束后统一回填。
+ * 低地址引用：offset_map 已填好，直接计算。
  */
-
 static int is_intra_page(const struct dbi_page_ctx *ctx, uint64_t target)
 {
     return target >= ctx->target_page &&
@@ -297,20 +291,21 @@ static int queue_pending_branch(struct dbi_page_ctx *ctx, int ghost_idx,
 /* B (imm26) */
 static int recomp_b(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
 {
-    int64_t imm26 = sign_extend64(insn & 0x03FFFFFFU, 26);
+    int64_t imm26 = dbi_sext(insn & 0x03FFFFFFU, 26);
     uint64_t target = orig_pc + (imm26 << 2);
     uint32_t enc;
 
-    /* Intra-page: jump to ghost equivalent of the target. Ghost region is
-     * small (<32KB), always fits B's ±128MB range, and avoids the X17
-     * clobber that far-jump expansion would need. This is CRITICAL for
-     * ART trampolines (e.g. imt_conflict_trampoline) where X17 carries
-     * the IMT key across the function body. */
+     /* 
+     * 页内：跳转到目标的 ghost 对应位置。ghost 区很小（<32KB），
+     * 永远落在 B 的 ±128MB 范围内，同时避免远跳转展开破坏 X17。
+     * 对 ART 跳板（如 imt_conflict_trampoline）这一点至关重要，
+     * 因为 X17 会在整个函数体内携带 IMT key。 
+     */
     if (is_intra_page(ctx, target)) {
         uint32_t tidx = (uint32_t)((target - ctx->target_page) >> 2);
         uint32_t this_tidx = (uint32_t)((orig_pc - ctx->target_page) >> 2);
         if (tidx < this_tidx) {
-            /* Backward — offset_map filled; emit direct B to ghost VA */
+            // 向低地址跳转
             uint64_t gtarget = intra_page_ghost_target(ctx, target);
             int64_t delta = (int64_t)(gtarget - ghost_cur_pc(ctx));
             if (enc_b(delta, &enc) == 0) {
@@ -318,7 +313,7 @@ static int recomp_b(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
                 return emit(ctx, enc);
             }
         } else {
-            /* Forward — queue backpatch with kind=3 (B imm26) */
+            // 向高地址跳转
             int ghost_idx = ctx->ghost_count;
             uint32_t tpl = 0x14000000U;  /* B, imm26=0 placeholder */
             if (emit(ctx, tpl) < 0) return -1;
@@ -347,7 +342,7 @@ static int recomp_b(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
  */
 static int recomp_bl(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
 {
-    int64_t imm26 = sign_extend64(insn & 0x03FFFFFFU, 26);
+    int64_t imm26 = dbi_sext(insn & 0x03FFFFFFU, 26);
     uint64_t target = orig_pc + (imm26 << 2);
     uint64_t new_pc = ghost_cur_pc(ctx);
     int64_t delta = (int64_t)(target - new_pc);
@@ -374,7 +369,7 @@ static int recomp_bl(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
 /* B.cond imm19 */
 static int recomp_bcond(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
 {
-    int64_t imm19 = sign_extend64((insn >> 5) & 0x7FFFFU, 19);
+    int64_t imm19 = dbi_sext((insn >> 5) & 0x7FFFFU, 19);
     uint64_t target = orig_pc + (imm19 << 2);
     uint32_t cond = insn & 0xFU;
     uint32_t enc;
@@ -434,7 +429,7 @@ static int recomp_cbz(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
     int is_nz = (insn & (1U << 24)) != 0;
     int sf = (insn >> 31) & 1U;
     uint32_t rt = insn & 0x1FU;
-    int64_t imm19 = sign_extend64((insn >> 5) & 0x7FFFFU, 19);
+    int64_t imm19 = dbi_sext((insn >> 5) & 0x7FFFFU, 19);
     uint64_t target = orig_pc + (imm19 << 2);
     uint32_t enc;
 
@@ -495,7 +490,7 @@ static int recomp_tbz(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
     uint32_t b5 = (insn >> 31) & 1U;
     uint32_t b40 = (insn >> 19) & 0x1FU;
     uint32_t bit = (b5 << 5) | b40;
-    int64_t imm14 = sign_extend64((insn >> 5) & 0x3FFFU, 14);
+    int64_t imm14 = dbi_sext((insn >> 5) & 0x3FFFU, 14);
     uint64_t target = orig_pc + (imm14 << 2);
     uint32_t enc;
 
@@ -553,7 +548,7 @@ static int recomp_adrp(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc
     uint32_t rd = insn & 0x1FU;
     uint64_t immlo = (insn >> 29) & 0x3U;
     uint64_t immhi = (insn >> 5) & 0x7FFFFU;
-    int64_t imm21 = sign_extend64((immhi << 2) | immlo, 21);
+    int64_t imm21 = dbi_sext((immhi << 2) | immlo, 21);
     uint64_t target = (orig_pc & ~0xFFFULL) + ((uint64_t)imm21 << 12);
     ctx->expanded++;
     return emit_load_addr(ctx, rd, target);
@@ -565,7 +560,7 @@ static int recomp_adr(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
     uint32_t rd = insn & 0x1FU;
     uint64_t immlo = (insn >> 29) & 0x3U;
     uint64_t immhi = (insn >> 5) & 0x7FFFFU;
-    int64_t imm21 = sign_extend64((immhi << 2) | immlo, 21);
+    int64_t imm21 = dbi_sext((immhi << 2) | immlo, 21);
     uint64_t target = orig_pc + (uint64_t)imm21;
     ctx->expanded++;
     return emit_load_addr(ctx, rd, target);
@@ -580,7 +575,7 @@ static int recomp_ldr_lit(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig
                           int variant)
 {
     uint32_t rt = insn & 0x1FU;
-    int64_t imm19 = sign_extend64((insn >> 5) & 0x7FFFFU, 19);
+    int64_t imm19 = dbi_sext((insn >> 5) & 0x7FFFFU, 19);
     uint64_t data_addr = orig_pc + (imm19 << 2);
     uint32_t ldr;
     ctx->expanded++;
@@ -605,12 +600,16 @@ static int recomp_ldr_vec_lit(struct dbi_page_ctx *ctx, uint32_t insn,
 {
     uint32_t rt = insn & 0x1FU;
     uint32_t opc = (insn >> 30) & 0x3U;
-    int64_t imm19 = sign_extend64((insn >> 5) & 0x7FFFFU, 19);
+    int64_t imm19 = dbi_sext((insn >> 5) & 0x7FFFFU, 19);
     uint64_t data_addr = orig_pc + (imm19 << 2);
     uint32_t ldr;
-    if (opc == 3) return -1;  /* reserved encoding */
+    if (opc == 3){
+        return -1;
+    } 
     ctx->expanded++;
-    if (emit_load_addr(ctx, DBI_SCRATCH_REG, data_addr) < 0) return -1;
+    if (emit_load_addr(ctx, DBI_SCRATCH_REG, data_addr) < 0){
+        return -1;
+    }
     ldr = enc_ldr_vec_imm_unsigned(rt, DBI_SCRATCH_REG, opc);
     return emit(ctx, ldr);
 }
@@ -620,8 +619,12 @@ static int recomp_ldr_vec_lit(struct dbi_page_ctx *ctx, uint32_t insn,
 int dbi_recompile_page(struct dbi_page_ctx *ctx)
 {
     int i;
-    if (!ctx || !ctx->orig || !ctx->ghost) return -1;
-    if (ctx->ghost_capacity < DBI_TARGET_INSNS) return -1;
+    if (!ctx || !ctx->orig || !ctx->ghost){
+        return -1;
+    }
+    if (ctx->ghost_capacity < DBI_TARGET_INSNS){
+        return -1;
+    }
 
     ctx->ghost_count = 0;
     ctx->fixed = 0;
@@ -639,35 +642,36 @@ int dbi_recompile_page(struct dbi_page_ctx *ctx)
 
         ctx->offset_map[i] = (uint16_t)prev_ghost_idx;
 
-        /* NOP — pass through */
+        // NOP 指令
         if (insn == 0xD503201FU) {
             ctx->passthrough++;
             rc = emit(ctx, insn);
         }
-            /* B (0) / BL (1) imm26 — top 6 bits 0b00010 1 or 1 00101 */
+        //  B 指令
         else if ((insn & 0xFC000000U) == 0x14000000U) {
             rc = recomp_b(ctx, insn, orig_pc);
         }
+        //  BL 指令
         else if ((insn & 0xFC000000U) == 0x94000000U) {
             rc = recomp_bl(ctx, insn, orig_pc);
         }
-            /* B.cond imm19 */
+        //  B.COND  指令
         else if ((insn & 0xFF000010U) == 0x54000000U) {
             rc = recomp_bcond(ctx, insn, orig_pc);
         }
-            /* CBZ/CBNZ */
+        //  CBZ/CBNZ 指令
         else if ((insn & 0x7E000000U) == 0x34000000U) {
             rc = recomp_cbz(ctx, insn, orig_pc);
         }
-            /* TBZ/TBNZ */
+        //  TBZ/TBNZ 指令
         else if ((insn & 0x7E000000U) == 0x36000000U) {
             rc = recomp_tbz(ctx, insn, orig_pc);
         }
-            /* ADRP */
+        //  ADRP 指令
         else if ((insn & 0x9F000000U) == 0x90000000U) {
             rc = recomp_adrp(ctx, insn, orig_pc);
         }
-            /* ADR */
+        //  ADR 指令
         else if ((insn & 0x9F000000U) == 0x10000000U) {
             rc = recomp_adr(ctx, insn, orig_pc);
         }
@@ -710,7 +714,23 @@ int dbi_recompile_page(struct dbi_page_ctx *ctx)
         }
     }
 
-    /* Backpatch forward intra-page conditional branches with final ghost PC */
+    /*
+     因为只重编译了原始的一页数据，而函数是极有可能跨越页的，所以需要这样一个操作。
+     在ghost 页的末尾直接跳回到原始页。
+     原始页是可以正常执行的。
+     */
+    {
+        uint64_t fall = ctx->target_page + DBI_TARGET_SIZE;
+        int64_t delta = (int64_t)(fall - ghost_cur_pc(ctx));
+        uint32_t enc;
+        if (enc_b(delta, &enc) == 0) {
+            if (emit(ctx, enc) < 0) return -1;
+        } else {
+            if (emit_far_jump(ctx, fall) < 0) return -1;
+        }
+    }
+
+    //  主循环结束之后，处理向高地址跳转的指令
     {
         int p;
         for (p = 0; p < ctx->n_pending; p++) {
@@ -790,10 +810,14 @@ int dbi_patch_ghost(struct dbi_page_ctx *ctx,
     unsigned idx;
     int ghost_idx;
     int i;
-    if (target_off >= DBI_TARGET_SIZE) return -1;
+    if (target_off >= DBI_TARGET_SIZE){
+         return -1;
+    }
     idx = target_off >> 2;
     ghost_idx = (int)ctx->offset_map[idx];
-    if (ghost_idx + patch_count > ctx->ghost_capacity) return -1;
+    if (ghost_idx + patch_count > ctx->ghost_capacity){
+        return -1;
+    }
     for (i = 0; i < patch_count; i++) {
         ctx->ghost[ghost_idx + i] = patch[i];
     }

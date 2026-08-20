@@ -3,6 +3,25 @@
 
 
 
+## 总体流程
+
+用户态只传入 pid、目标函数地址，hook ptrcl 得到数据。
+
+
+## main.c 
+
+用来获取符号地址，注册函数 hook 
+
+
+
+
+## hookmanager.c 
+用来管理hook record，
+
+
+
+
+
 
 ## pte_m 
 
