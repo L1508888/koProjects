@@ -2,6 +2,9 @@
 因为pte hook 过程中会涉及到很多内核操作，在test 目录下进行函数的测试。
 
 
+用户态指定进程和地址，使用重编译的方式进行hook，这个hook 目前还是有问题，目前只实现了使用 hwbp 的方式进行hook，并没有实现 inline hook 的方式。
+
+
 
 ## 总体流程
 
@@ -17,8 +20,6 @@
 
 ## hookmanager.c 
 用来管理hook record，
-
-
 
 
 

@@ -312,6 +312,15 @@ static int recomp_b(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
                 ctx->intra_page_fixed++;
                 return emit(ctx, enc);
             }
+        } else if (ctx->finalized) {
+            /* 主循环已结束（清扫槽重定位）：offset_map 完整，直接计算 */
+            uint64_t gtarget = intra_page_ghost_target(ctx, target);
+            int64_t delta = (int64_t)(gtarget - ghost_cur_pc(ctx));
+            if (enc_b(delta, &enc) == 0) {
+                ctx->intra_page_fixed++;
+                return emit(ctx, enc);
+            }
+            /* 失败则落到页间路径（跳回原页，靠 fault 弹回 ghost，仍正确） */
         } else {
             // 向高地址跳转
             int ghost_idx = ctx->ghost_count;
@@ -385,6 +394,14 @@ static int recomp_bcond(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_p
                 ctx->intra_page_fixed++;
                 return emit(ctx, enc);
             }
+        } else if (ctx->finalized) {
+            /* 主循环已结束（清扫槽重定位）：offset_map 完整，直接计算 */
+            uint64_t gtarget = intra_page_ghost_target(ctx, target);
+            int64_t delta = (int64_t)(gtarget - ghost_cur_pc(ctx));
+            if (enc_b_cond(cond, delta, &enc) == 0) {
+                ctx->intra_page_fixed++;
+                return emit(ctx, enc);
+            }
         } else {
             /* Forward — queue backpatch. Template imm19=0. */
             int ghost_idx = ctx->ghost_count;
@@ -438,6 +455,14 @@ static int recomp_cbz(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
         uint32_t this_tidx = (uint32_t)((orig_pc - ctx->target_page) >> 2);
         if (tidx < this_tidx) {
             /* Backward — offset_map[tidx] is filled */
+            uint64_t gtarget = intra_page_ghost_target(ctx, target);
+            int64_t delta = (int64_t)(gtarget - ghost_cur_pc(ctx));
+            if (enc_cbz(sf, rt, delta, is_nz, &enc) == 0) {
+                ctx->intra_page_fixed++;
+                return emit(ctx, enc);
+            }
+        } else if (ctx->finalized) {
+            /* 主循环已结束（清扫槽重定位）：offset_map 完整，直接计算 */
             uint64_t gtarget = intra_page_ghost_target(ctx, target);
             int64_t delta = (int64_t)(gtarget - ghost_cur_pc(ctx));
             if (enc_cbz(sf, rt, delta, is_nz, &enc) == 0) {
@@ -498,6 +523,14 @@ static int recomp_tbz(struct dbi_page_ctx *ctx, uint32_t insn, uint64_t orig_pc)
         uint32_t tidx = (uint32_t)((target - ctx->target_page) >> 2);
         uint32_t this_tidx = (uint32_t)((orig_pc - ctx->target_page) >> 2);
         if (tidx < this_tidx) {
+            uint64_t gtarget = intra_page_ghost_target(ctx, target);
+            int64_t delta = (int64_t)(gtarget - ghost_cur_pc(ctx));
+            if (enc_tbz(rt, bit, delta, is_nz, &enc) == 0) {
+                ctx->intra_page_fixed++;
+                return emit(ctx, enc);
+            }
+        } else if (ctx->finalized) {
+            /* 主循环已结束（清扫槽重定位）：offset_map 完整，直接计算 */
             uint64_t gtarget = intra_page_ghost_target(ctx, target);
             int64_t delta = (int64_t)(gtarget - ghost_cur_pc(ctx));
             if (enc_tbz(rt, bit, delta, is_nz, &enc) == 0) {
@@ -614,6 +647,105 @@ static int recomp_ldr_vec_lit(struct dbi_page_ctx *ctx, uint32_t insn,
     return emit(ctx, ldr);
 }
 
+/*
+ * 重编译单条指令（原页第 i 条）到 ghost 当前末尾。
+ * 从主循环提取出来，供两个场景复用：
+ *   1. dbi_recompile_page 的主循环（整页重编译）；
+ *   2. dbi_emit_relocated_insn（BRK 探针的清扫槽：把某条指令在 ghost
+ *      末尾重新生成一份，PC 相对修正按新位置重新计算）。
+ * 注意：本函数不写 offset_map（由调用方按需处理），失败时由调用方回滚。
+ */
+static int recomp_one(struct dbi_page_ctx *ctx, int i)
+{
+    uint32_t insn = ctx->orig[i];
+    uint64_t orig_pc = ctx->target_page + (uint64_t)(i * 4);
+
+    // NOP 指令
+    if (insn == 0xD503201FU) {
+        ctx->passthrough++;
+        return emit(ctx, insn);
+    }
+    //  B 指令
+    if ((insn & 0xFC000000U) == 0x14000000U) {
+        return recomp_b(ctx, insn, orig_pc);
+    }
+    //  BL 指令
+    if ((insn & 0xFC000000U) == 0x94000000U) {
+        return recomp_bl(ctx, insn, orig_pc);
+    }
+    //  B.COND  指令
+    if ((insn & 0xFF000010U) == 0x54000000U) {
+        return recomp_bcond(ctx, insn, orig_pc);
+    }
+    //  CBZ/CBNZ 指令
+    if ((insn & 0x7E000000U) == 0x34000000U) {
+        return recomp_cbz(ctx, insn, orig_pc);
+    }
+    //  TBZ/TBNZ 指令
+    if ((insn & 0x7E000000U) == 0x36000000U) {
+        return recomp_tbz(ctx, insn, orig_pc);
+    }
+    //  ADRP 指令
+    if ((insn & 0x9F000000U) == 0x90000000U) {
+        return recomp_adrp(ctx, insn, orig_pc);
+    }
+    //  ADR 指令
+    if ((insn & 0x9F000000U) == 0x10000000U) {
+        return recomp_adr(ctx, insn, orig_pc);
+    }
+    /* LDR (literal) 32-bit */
+    if ((insn & 0xFF000000U) == 0x18000000U) {
+        return recomp_ldr_lit(ctx, insn, orig_pc, 0);
+    }
+    /* LDR (literal) 64-bit */
+    if ((insn & 0xFF000000U) == 0x58000000U) {
+        return recomp_ldr_lit(ctx, insn, orig_pc, 1);
+    }
+    /* LDRSW literal — 32-bit load, sign-extend to 64-bit Xt.
+     * Variant 2: use enc_ldrsw_imm_unsigned to preserve sign extension. */
+    if ((insn & 0xFF000000U) == 0x98000000U) {
+        return recomp_ldr_lit(ctx, insn, orig_pc, 2);
+    }
+    /* PRFM literal — drop to NOP (prefetch is a hint, safe to omit) */
+    if ((insn & 0xFF000000U) == 0xD8000000U) {
+        ctx->expanded++;
+        return emit(ctx, enc_nop());
+    }
+    /* LDR SIMD literal — 32/64/128-bit float/double/Q load, PC-relative.
+     * Encoding pattern (bits 31..24): opc[1:0] 0 1 1 1 0 0.
+     * Check bits[29:24] = 011100 exactly. */
+    if ((insn & 0x3F000000U) == 0x1C000000U) {
+        return recomp_ldr_vec_lit(ctx, insn, orig_pc);
+    }
+    /* Everything else — pass through */
+    ctx->passthrough++;
+    return emit(ctx, insn);
+}
+
+/*
+ * 在 ghost 当前末尾重新生成原页第 idx 条指令（BRK 探针清扫槽用）。
+ * 要求 ctx->finalized=1（主循环已结束、offset_map 完整），
+ * 这样前向页内分支会直接计算而不是进 pending 队列。
+ * 失败返回 -1 并回滚已发射的内容。
+ */
+int dbi_emit_relocated_insn(struct dbi_page_ctx *ctx, int idx)
+{
+    int prev, rc;
+
+    if (!ctx || !ctx->orig || !ctx->ghost)
+        return -1;
+    if (idx < 0 || idx >= DBI_TARGET_INSNS)
+        return -1;
+
+    prev = ctx->ghost_count;
+    rc = recomp_one(ctx, idx);
+    if (rc < 0) {
+        ctx->ghost_count = prev;
+        return -1;
+    }
+    return 0;
+}
+
 /* ---------- Main recompile loop ---------- */
 
 int dbi_recompile_page(struct dbi_page_ctx *ctx)
@@ -633,77 +765,16 @@ int dbi_recompile_page(struct dbi_page_ctx *ctx)
     ctx->failed = 0;
     ctx->intra_page_fixed = 0;
     ctx->n_pending = 0;
+    ctx->finalized = 0;
+    ctx->trailer_idx = -1;
 
     for (i = 0; i < DBI_TARGET_INSNS; i++) {
-        uint32_t insn = ctx->orig[i];
-        uint64_t orig_pc = ctx->target_page + (uint64_t)(i * 4);
         int rc = 0;
         int prev_ghost_idx = ctx->ghost_count;
 
         ctx->offset_map[i] = (uint16_t)prev_ghost_idx;
 
-        // NOP 指令
-        if (insn == 0xD503201FU) {
-            ctx->passthrough++;
-            rc = emit(ctx, insn);
-        }
-        //  B 指令
-        else if ((insn & 0xFC000000U) == 0x14000000U) {
-            rc = recomp_b(ctx, insn, orig_pc);
-        }
-        //  BL 指令
-        else if ((insn & 0xFC000000U) == 0x94000000U) {
-            rc = recomp_bl(ctx, insn, orig_pc);
-        }
-        //  B.COND  指令
-        else if ((insn & 0xFF000010U) == 0x54000000U) {
-            rc = recomp_bcond(ctx, insn, orig_pc);
-        }
-        //  CBZ/CBNZ 指令
-        else if ((insn & 0x7E000000U) == 0x34000000U) {
-            rc = recomp_cbz(ctx, insn, orig_pc);
-        }
-        //  TBZ/TBNZ 指令
-        else if ((insn & 0x7E000000U) == 0x36000000U) {
-            rc = recomp_tbz(ctx, insn, orig_pc);
-        }
-        //  ADRP 指令
-        else if ((insn & 0x9F000000U) == 0x90000000U) {
-            rc = recomp_adrp(ctx, insn, orig_pc);
-        }
-        //  ADR 指令
-        else if ((insn & 0x9F000000U) == 0x10000000U) {
-            rc = recomp_adr(ctx, insn, orig_pc);
-        }
-            /* LDR (literal) 32-bit */
-        else if ((insn & 0xFF000000U) == 0x18000000U) {
-            rc = recomp_ldr_lit(ctx, insn, orig_pc, 0);
-        }
-            /* LDR (literal) 64-bit */
-        else if ((insn & 0xFF000000U) == 0x58000000U) {
-            rc = recomp_ldr_lit(ctx, insn, orig_pc, 1);
-        }
-            /* LDRSW literal — 32-bit load, sign-extend to 64-bit Xt.
-             * Variant 2: use enc_ldrsw_imm_unsigned to preserve sign extension. */
-        else if ((insn & 0xFF000000U) == 0x98000000U) {
-            rc = recomp_ldr_lit(ctx, insn, orig_pc, 2);
-        }
-            /* PRFM literal — drop to NOP (prefetch is a hint, safe to omit) */
-        else if ((insn & 0xFF000000U) == 0xD8000000U) {
-            ctx->expanded++;
-            rc = emit(ctx, enc_nop());
-        }
-            /* LDR SIMD literal — 32/64/128-bit float/double/Q load, PC-relative.
-             * Encoding pattern (bits 31..24): opc[1:0] 0 1 1 1 0 0.
-             * Check bits[29:24] = 011100 exactly. */
-        else if ((insn & 0x3F000000U) == 0x1C000000U) {
-            rc = recomp_ldr_vec_lit(ctx, insn, orig_pc);
-        }
-            /* Everything else — pass through */
-        else {
-            ctx->passthrough++;
-            rc = emit(ctx, insn);
-        }
+        rc = recomp_one(ctx, i);
 
         if (rc < 0) {
             ctx->failed++;
@@ -719,6 +790,7 @@ int dbi_recompile_page(struct dbi_page_ctx *ctx)
      在ghost 页的末尾直接跳回到原始页。
      原始页是可以正常执行的。
      */
+    ctx->trailer_idx = ctx->ghost_count;
     {
         uint64_t fall = ctx->target_page + DBI_TARGET_SIZE;
         int64_t delta = (int64_t)(fall - ghost_cur_pc(ctx));
@@ -729,6 +801,9 @@ int dbi_recompile_page(struct dbi_page_ctx *ctx)
             if (emit_far_jump(ctx, fall) < 0) return -1;
         }
     }
+    /* 主循环与收尾跳转完成：offset_map 已完整，
+     * 之后再重编译单条指令（BRK 探针清扫槽）时前向页内分支直接计算 */
+    ctx->finalized = 1;
 
     //  主循环结束之后，处理向高地址跳转的指令
     {
@@ -800,6 +875,74 @@ uint64_t dbi_target_to_ghost_pc(const struct dbi_page_ctx *ctx,
     if (off >= DBI_TARGET_SIZE) return 0;
     idx = (unsigned)(off >> 2);
     return ctx->ghost_page + ((uint64_t)ctx->offset_map[idx] << 2);
+}
+
+/*
+ * BRK 探针打点（hookManager 用）：
+ *   1. 在 ghost 末尾重新生成原页第 idx 条指令（清扫槽，PC 相对修正按新位置算）；
+ *   2. 追加一条 B 跳回该指令在 ghost 中的正常后继位置；
+ *   3. 把该指令在 ghost 中的原位置第一个字覆盖为 brk_insn。
+ * 之后执行流路过该位置即触发 BRK 异常。
+ * 成功返回清扫槽字索引，失败返回 -1。要求 ctx->finalized=1。
+ */
+int dbi_emit_brk_probe(struct dbi_page_ctx *ctx, int idx, uint32_t brk_insn)
+{
+    uint64_t back_pc, back_target;
+    int64_t delta;
+    uint32_t enc;
+    int cleanup_idx;
+
+    if (!ctx || !ctx->finalized || !ctx->orig || !ctx->ghost)
+        return -1;
+    if (idx < 0 || idx >= DBI_TARGET_INSNS)
+        return -1;
+
+    /* 1. 清扫槽：重生成原指令 */
+    cleanup_idx = ctx->ghost_count;
+    if (dbi_emit_relocated_insn(ctx, idx) < 0)
+        return -1;
+
+    /* 2. 跳回正常后继：下一条原始指令的 ghost 位置；
+     *    页内最后一条则跳回页尾收尾跳转（由它弹回原进程下一页） */
+    back_pc = ctx->ghost_page + (uint64_t)ctx->ghost_count * 4;
+    if (idx + 1 < DBI_TARGET_INSNS)
+        back_target = ctx->ghost_page + (uint64_t)ctx->offset_map[idx + 1] * 4;
+    else if (ctx->trailer_idx >= 0)
+        back_target = ctx->ghost_page + (uint64_t)ctx->trailer_idx * 4;
+    else
+        return -1;
+
+    delta = (int64_t)(back_target - back_pc);
+    if (enc_b(delta, &enc) != 0)
+        return -1;
+    if (emit(ctx, enc) < 0)
+        return -1;
+
+    /* 3. 覆盖原位置为 BRK。若原指令被展开成多字，其余字成为死代码——
+     *    分支目标只会落在 offset_map 的指令边界上，不会指进展开段中间 */
+    ctx->ghost[ctx->offset_map[idx]] = brk_insn;
+    return cleanup_idx;
+}
+
+/*
+ * 拆除 BRK 探针：在原位置重新生成该指令的展开序列。
+ * 重编译是（指令, 原地址, ghost 位置, offset_map）的确定函数，
+ * 产物与当初逐字一致，BRK 被覆盖回原指令；清扫槽变死代码，无害。
+ */
+int dbi_remove_brk_probe(struct dbi_page_ctx *ctx, int idx)
+{
+    int saved_count, rc;
+
+    if (!ctx || !ctx->finalized || !ctx->orig || !ctx->ghost)
+        return -1;
+    if (idx < 0 || idx >= DBI_TARGET_INSNS)
+        return -1;
+
+    saved_count = ctx->ghost_count;
+    ctx->ghost_count = ctx->offset_map[idx];    /* 在原位置重新生成 */
+    rc = recomp_one(ctx, idx);
+    ctx->ghost_count = saved_count;
+    return rc < 0 ? -1 : 0;
 }
 
 int dbi_patch_ghost(struct dbi_page_ctx *ctx,

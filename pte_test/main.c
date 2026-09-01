@@ -23,12 +23,14 @@
 
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
+#include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
+#include <asm/debug-monitors.h>
 
 #include "hookManager.h"
 
@@ -65,6 +67,12 @@ static dcache_clean_pou_t  g_dcache_clean_pou;   /* 改名后的 (start,end) 变
 
 
 static copy_from_user_nofault_t copy_from_fn;
+
+/* 用户态 BRK 钩子注册/注销（未 EXPORT，kallsyms 解析注入）。
+ * 注意 typedef 必须与内核原型逐字一致（CFI） */
+typedef void (*register_user_break_hook_t)(struct break_hook *hook);
+static register_user_break_hook_t g_register_brk;
+static register_user_break_hook_t g_unregister_brk;
 
 static __nocfi void flush_dcache_shim(void *addr, size_t len)
 {
@@ -130,6 +138,12 @@ static __nocfi int resolve_kernel_symbols(void) {
       g_dcache_clean_pou = (dcache_clean_pou_t)kln("dcache_clean_inval_poc");
   }
   g_ghost_syms.flush_dcache_area = flush_dcache_shim;
+
+  /* 用户态 BRK 钩子（ghost 探针用）。可选：解析不到就关闭 BRK 探针功能 */
+  g_register_brk = (register_user_break_hook_t)kln("register_user_break_hook");
+  g_unregister_brk = (register_user_break_hook_t)kln("unregister_user_break_hook");
+  pr_info("pte_hook: register_user_break_hook=%px unregister=%px\n",
+          (void *)g_register_brk, (void *)g_unregister_brk);
 
   
   /* 每个符号都打印出来，方便排查解析失败（显示 0 的就是没找到） */
@@ -237,6 +251,35 @@ static int mem_abort_pre(struct kprobe *p, struct pt_regs *regs) {
   return 0; /* 与我们无关：永不改 pc，原函数照常执行 */
 }
 
+/* ---------- 用户态 BRK 钩子：ghost 内 BRK 探针 ----------
+ *
+ * 注意：绝不能 kprobe do_debug_exception——它在 kprobe 自身的 BRK 处理
+ * 路径上（内核 BRK → el1_dbg → do_debug_exception → call_break_hook
+ * → kprobe 处理器）。给它挂探针会导致每次 kprobe 触发都递归重入，
+ * 设备直接挂死重启（踩过的坑）。
+ *
+ * 正确做法是 register_user_break_hook：内核给用户态 BRK 留的正规
+ * 注册接口（未 EXPORT，经 kallsyms 解析）。内核按 imm/mask 匹配
+ * BRK 的 imm16 后才回调，regs 直接是用户态寄存器快照，
+ * 且 regs->pc = BRK 指令本身的地址。
+ */
+
+static int __nocfi pte_brk_handler(struct pt_regs *uregs, unsigned int esr)
+{
+  if (hook_handle_brk(uregs, esr))
+    return DBG_HOOK_HANDLED;
+  return DBG_HOOK_ERROR;
+}
+
+/* imm=魔数高字节，mask=忽略低字节（探针编号不参与匹配） */
+static struct break_hook g_pte_brk_hook = {
+  .fn   = pte_brk_handler,
+  .imm  = 0xBE00,
+  .mask = 0x00FF,
+};
+
+static int g_brk_hook_registered;
+
 /* ---------- 模块初始化 / 退出 ---------- */
 
 static int __init init_mod(void) {
@@ -276,6 +319,18 @@ static int __init init_mod(void) {
   }
   pr_info("pte_hook: do_mem_abort hook success \n");
 
+  /* 注册用户态 BRK 钩子（ghost 内 BRK 探针）。
+   * 符号缺失不致命：BRK 探针保持关闭，观察点退化为页入口 dump */
+  if (g_register_brk) {
+    g_register_brk(&g_pte_brk_hook);
+    g_brk_hook_registered = 1;
+    hook_manager_brk_enable(1);
+    pr_info("pte_hook: user break hook success \n");
+  } else {
+    hook_manager_brk_enable(0);
+    pr_warn("pte_hook: register_user_break_hook not found, brk probe disabled\n");
+  }
+
   pr_info("pte_hook: module load success \n");
   return 0;
 }
@@ -286,6 +341,10 @@ static void __exit exit_mod(void) {
    * 然后卸载已安装的 hook（恢复 PTE、释放 ghost），
    * 最后摘 do_mem_abort 钩子 */
   unregister_kprobe(&kp);
+  if (g_brk_hook_registered && g_unregister_brk) {
+    g_unregister_brk(&g_pte_brk_hook);
+    g_brk_hook_registered = 0;
+  }
   hook_manager_wq_exit();
   uninstall_all_hooks();
   unregister_kprobe(&mem_abort_kp);

@@ -21,14 +21,16 @@ void dump_user_args(struct pt_regs *uregs, unsigned long far)
         return;
     }
 
-    pr_info("pte_hook: args@0x%lx pc=0x%lx lr=0x%lx sp=0x%lx\n",
-            far, uregs->pc, uregs->regs[30], uregs->sp);
-    pr_info("pte_hook: x0=%lx x1=%lx x2=%lx x3=%lx\n",
-            uregs->regs[0], uregs->regs[1],
-            uregs->regs[2], uregs->regs[3]);
-    pr_info("pte_hook: x4=%lx x5=%lx x6=%lx x7=%lx\n",
-            uregs->regs[4], uregs->regs[5],
-            uregs->regs[6], uregs->regs[7]);
+    pr_info("pte_hook: w0= 0x%08x   w21= 0x%08x", uregs->regs[0], uregs->regs[21]);
+
+//     pr_info("pte_hook: args@0x%lx pc=0x%lx lr=0x%lx sp=0x%lx\n",
+//             far, uregs->pc, uregs->regs[30], uregs->sp);
+//     pr_info("pte_hook: x0=%lx x1=%lx x2=%lx x3=%lx\n",
+//             uregs->regs[0], uregs->regs[1],
+//             uregs->regs[2], uregs->regs[3]);
+//     pr_info("pte_hook: x4=%lx x5=%lx x6=%lx x7=%lx\n",
+//             uregs->regs[4], uregs->regs[5],
+//             uregs->regs[6], uregs->regs[7]);
 
     /* 载荷 dump（x1 指针的前 0x40 字节）暂时关闭：
      * 本函数运行在 kprobe 原子上下文，读用户内存需要 kallsyms 解析注入

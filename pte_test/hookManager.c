@@ -70,6 +70,24 @@
 #define HOOK_ADDRS_PER_PAGE  8
 
 
+/*
+ * BRK 探针：观察"ghost 页内某偏移被执行"的时刻。
+ * 原理：执行流被 UXN 重定向进 ghost 后就不再产生异常，页内中途点
+ * 内核感知不到。因此在 ghost 里观察点对应位置覆盖一条 BRK 指令，
+ * 触发 EL0 BRK 异常（EC=0x3C），由 do_debug_exception 的 kprobe 接管：
+ * dump 寄存器现场后，把 pc 改到 ghost 末尾的"清扫槽"（被覆盖指令的
+ * 重生成副本 + 跳回正常后继的 B），执行流无损继续。
+ */
+#define BRK_MAGIC       0xBE00U     /* BRK imm16 高字节魔数，低字节为探针编号 */
+#define BRK_INSN(id)    (0xD4200000U | ((BRK_MAGIC | (uint32_t)(id)) << 5))
+
+struct brk_probe {
+    int          used;
+    unsigned int idx;          /* 观察点在原页的指令索引 */
+    unsigned int ghost_idx;    /* BRK 覆盖位置（ghost 字索引） */
+    unsigned int cleanup_idx;  /* 清扫槽起始（ghost 字索引） */
+};
+
 /* 单个 hook 槽位：对应一个被 UXN 武装的 4KB 目标页 */
 struct hook_record {
     int             used;           /* 槽位占用标志（槽位管理用，fault 路径看 armed） */
@@ -83,7 +101,21 @@ struct hook_record {
     int             n_addrs;        /* 本页观察的函数入口数 */
     unsigned long   addrs[HOOK_ADDRS_PER_PAGE]; //	一页内会包含很多个函数，同一个页内被hook 的函数地址，这里记录的是原始函数的地址
     int             dbg_cnt;        /* 本槽位重定向日志限幅计数 */
+
+    int             ghost_words;    /* ghost 已写入总字数（含收尾跳转与清扫槽） */
+    int             trailer_idx;    /* 页尾收尾跳转的 ghost 字索引 */
+    uint32_t        orig_page[DBI_TARGET_INSNS]; /* 原页指令备份（运行时加/删探针重定位用） */
+    struct brk_probe probes[HOOK_ADDRS_PER_PAGE];
 };
+
+/* do_debug_exception kprobe 是否就位：未就位时不能打 BRK 探针
+ * （否则 BRK 触发后无人接管，目标进程会吃 SIGTRAP 崩掉） */
+static int g_brk_enabled;
+
+void hook_manager_brk_enable(int enabled)
+{
+    g_brk_enabled = enabled;
+}
 
 /*
  * workqueue 请求项：kprobe 前置里分配（GFP_ATOMIC）并入队，
@@ -427,6 +459,172 @@ static void slot_remove_watch_addr(struct hook_record *rec, unsigned long va)
     }
 }
 
+/* ---------- BRK 探针（ghost 内观察点） ---------- */
+
+/* 该观察地址是否已有 BRK 探针（有则 fault 路径不再重复 dump） */
+static int slot_has_probe(struct hook_record *rec, unsigned int idx)
+{
+    int j;
+
+    for (j = 0; j < HOOK_ADDRS_PER_PAGE; j++)
+        if (rec->probes[j].used && rec->probes[j].idx == idx)
+            return 1;
+    return 0;
+}
+
+/*
+ * 从槽位数据重建一个反映当前 ghost 状态的临时 ctx
+ * （运行时已武装页面上加/删探针用）。ghost_buf 由调用方提供
+ * （DBI_GHOST_MAX_BYTES），返回的 ctx 用完需 kvfree。
+ */
+static struct dbi_page_ctx *slot_build_ctx(struct hook_record *rec,
+                                           uint32_t *ghost_buf)
+{
+    struct dbi_page_ctx *ctx;
+    int i;
+
+    ctx = kvzalloc(sizeof(*ctx), GFP_KERNEL);
+    if (!ctx)
+        return NULL;
+
+    ctx->target_page    = rec->target_page;
+    ctx->ghost_page     = rec->ghost.vaddr;
+    ctx->orig           = rec->orig_page;
+    ctx->ghost          = ghost_buf;
+    ctx->ghost_capacity = (int)(rec->ghost.alloc_size / 4);
+    ctx->ghost_count    = rec->ghost_words;
+    ctx->finalized      = 1;
+    ctx->trailer_idx    = rec->trailer_idx;
+    for (i = 0; i < DBI_TARGET_INSNS; i++)
+        ctx->offset_map[i] = (uint16_t)rec->ghost.offsets[i];
+    memcpy(ghost_buf, (void *)rec->ghost.kaddr, (size_t)rec->ghost_words * 4);
+    return ctx;
+}
+
+/* 把临时 ctx 的改动写回 ghost 物理页并同步 i-cache */
+static int __nocfi slot_commit_ctx(struct hook_record *rec,
+                                   struct dbi_page_ctx *ctx)
+{
+    memcpy((void *)rec->ghost.kaddr, ctx->ghost, (size_t)ctx->ghost_count * 4);
+    rec->ghost_words = ctx->ghost_count;
+    return ghost_sync_icache(&rec->ghost, (unsigned long)ctx->ghost_count * 4);
+}
+
+/* 在 ctx 上为观察地址打探针的公共尾部：登记 probes[] 表 */
+static void slot_probe_register(struct hook_record *rec, unsigned int idx,
+                                unsigned int ghost_idx, int cleanup_idx, int id)
+{
+    rec->probes[id].used        = 1;
+    rec->probes[id].idx         = idx;
+    rec->probes[id].ghost_idx   = ghost_idx;
+    rec->probes[id].cleanup_idx = (unsigned int)cleanup_idx;
+}
+
+/* 给观察地址打 BRK 探针（在已反映 ghost 状态的 ctx 上操作）。
+ * 返回 0 成功；失败不影响主流程（退化为只在页入口 fault 时 dump）。 */
+static int slot_probe_emit(struct hook_record *rec, struct dbi_page_ctx *ctx,
+                           unsigned long va)
+{
+    unsigned int idx;
+    int id, cleanup;
+
+    if (!g_brk_enabled)
+        return -ENODEV;
+    /* 注意用 ctx->target_page：安装路径里此时 rec 字段还没填 */
+    if (va < ctx->target_page)
+        return -EINVAL;
+    idx = (unsigned int)((va - ctx->target_page) >> 2);
+    if (idx >= DBI_TARGET_INSNS)
+        return -EINVAL;
+    if (slot_has_probe(rec, idx))
+        return 0;
+
+    for (id = 0; id < HOOK_ADDRS_PER_PAGE; id++)
+        if (!rec->probes[id].used)
+            break;
+    if (id == HOOK_ADDRS_PER_PAGE)
+        return -ENOSPC;
+
+    cleanup = dbi_emit_brk_probe(ctx, (int)idx, BRK_INSN(id));
+    if (cleanup < 0)
+        return -EINVAL;
+
+    slot_probe_register(rec, idx, ctx->offset_map[idx], cleanup, id);
+    pr_info("pte_hook: brk probe @0x%lx -> ghost off 0x%x, cleanup off 0x%x\n",
+            va, ctx->offset_map[idx] * 4, cleanup * 4);
+    return 0;
+}
+
+/* 运行时给已武装的槽位追加观察地址 + 打 BRK 探针（kworker 进程上下文） */
+static void __nocfi slot_watch_add(struct hook_record *rec, unsigned long va)
+{
+    uint32_t *buf;
+    struct dbi_page_ctx *ctx;
+
+    if (!slot_add_watch_addr(rec, va)) {
+        pr_info("pte_hook: 0x%lx already watched (or watch list full)\n", va);
+        return;
+    }
+    pr_info("pte_hook: reuse slot, watch 0x%lx (page 0x%lx already armed)\n",
+            va, rec->target_page);
+
+    if (!g_brk_enabled)
+        return;
+
+    buf = kvzalloc(DBI_GHOST_MAX_BYTES, GFP_KERNEL);
+    if (!buf)
+        return;
+    ctx = slot_build_ctx(rec, buf);
+    if (!ctx) {
+        kvfree(buf);
+        return;
+    }
+    if (slot_probe_emit(rec, ctx, va) == 0) {
+        if (slot_commit_ctx(rec, ctx))
+            pr_err("pte_hook: brk probe commit fail (i-cache sync)\n");
+    } else {
+        pr_warn("pte_hook: brk probe emit fail for 0x%lx\n", va);
+    }
+    kvfree(ctx);
+    kvfree(buf);
+}
+
+/* 拆除观察地址对应的 BRK 探针：把 BRK 位置恢复为原始指令序列 */
+static void __nocfi slot_probe_remove(struct hook_record *rec, unsigned long va)
+{
+    unsigned int idx;
+    uint32_t *buf;
+    struct dbi_page_ctx *ctx;
+    int j;
+
+    if (va < rec->target_page)
+        return;
+    idx = (unsigned int)((va - rec->target_page) >> 2);
+    if (idx >= DBI_TARGET_INSNS)
+        return;
+
+    for (j = 0; j < HOOK_ADDRS_PER_PAGE; j++) {
+        if (rec->probes[j].used && rec->probes[j].idx == idx)
+            break;
+    }
+    if (j == HOOK_ADDRS_PER_PAGE)
+        return;                         /* 没有探针，无需恢复 */
+
+    buf = kvzalloc(DBI_GHOST_MAX_BYTES, GFP_KERNEL);
+    if (!buf)
+        return;
+    ctx = slot_build_ctx(rec, buf);
+    if (ctx) {
+        /* 在原位置重新生成该指令的展开序列（位置相同，产物逐字一致），
+         * BRK 被覆盖回原指令；清扫槽成为死代码，无害 */
+        if (dbi_remove_brk_probe(ctx, (int)idx) == 0)
+            slot_commit_ctx(rec, ctx);
+        kvfree(ctx);
+    }
+    kvfree(buf);
+    rec->probes[j].used = 0;
+}
+
 /*
  * 拆除一个槽位：解除武装 → 恢复 PTE → 释放 ghost → 清空槽位。
  * 仅进程上下文调用（可睡眠）。
@@ -474,6 +672,9 @@ static void __nocfi slot_teardown(struct hook_record *rec)
     rec->pid = 0;
     rec->target_page = 0;
     rec->n_addrs = 0;
+    rec->ghost_words = 0;
+    rec->trailer_idx = -1;
+    memset(rec->probes, 0, sizeof(rec->probes));
 }
 
 /*
@@ -531,11 +732,8 @@ static void __nocfi do_install(HookTask *task)
      */
     rec = find_slot_by_page(task->pid, page);
     if (rec) {
-        if (slot_add_watch_addr(rec, va))
-            pr_info("pte_hook: reuse slot, watch 0x%lx (page 0x%lx already armed)\n",
-                    va, page);
-        else
-            pr_info("pte_hook: 0x%lx already watched (or watch list full)\n", va);
+        /* 同页复用：登记观察地址并补打 BRK 探针（实时改 ghost + 刷 i-cache） */
+        slot_watch_add(rec, va);
         return;
     }
 
@@ -545,6 +743,10 @@ static void __nocfi do_install(HookTask *task)
         pr_warn("pte_hook: no free slot (max %d)\n", MAX_RECORD);
         return;
     }
+    /* 防御：清掉可能残留的上次安装痕迹（失败回滚路径可能留下探针标记） */
+    memset(rec->probes, 0, sizeof(rec->probes));
+    rec->ghost_words = 0;
+    rec->trailer_idx = -1;
 
     target = get_task_by_pid(task->pid);
     if (!target) {
@@ -613,7 +815,14 @@ static void __nocfi do_install(HookTask *task)
         ret = ret ? ret : -EOPNOTSUPP;
         goto out_free;
     }
-    /* 双保险：输出不得超过 ghost 实际分配的字节数 */
+
+    /* 3.5 给观察地址打 BRK 探针：执行流路过 ghost 内该位置时陷入内核
+     *    dump 寄存器。失败只降级为"页入口 dump"，不影响安装。 */
+    if (slot_probe_emit(rec, ctx, va))
+        pr_warn("pte_hook: brk probe unavailable for 0x%lx, entry-dump only\n",
+                va);
+
+    /* 双保险：输出（含探针清扫槽）不得超过 ghost 实际分配的字节数 */
     if ((size_t)ctx->ghost_count * 4 > rec->ghost.alloc_size) {
         pr_err("pte_hook: dbi out %d more than ghost %lu\n",
                ctx->ghost_count * 4, rec->ghost.alloc_size);
@@ -632,9 +841,13 @@ static void __nocfi do_install(HookTask *task)
         goto out_free;
     }
 
-    /* 5. 把指令映射表存进 ghost 元数据，abort 路径直接查表 */
+    /* 5. 把指令映射表存进 ghost 元数据，abort 路径直接查表；
+     *    同时保存原页副本与 ghost 元信息（运行时加/删探针要重建 ctx） */
     for (i = 0; i < DBI_TARGET_INSNS; i++)
         rec->ghost.offsets[i] = ctx->offset_map[i];
+    rec->ghost_words = ctx->ghost_count;
+    rec->trailer_idx = ctx->trailer_idx;
+    memcpy(rec->orig_page, orig, PAGE_SIZE);
 
     /* 6. 先填写槽位并武装，再设 UXN（顺序关键）。
      *    若先设 UXN 后武装，两者之间的窗口里目标页一旦被取指，
@@ -695,6 +908,7 @@ static void __nocfi do_uninstall(HookTask *task)
     }
 
     slot_remove_watch_addr(rec, va);
+    slot_probe_remove(rec, va);     /* 同步拆掉 BRK 探针，恢复 ghost 原指令 */
     if (rec->n_addrs > 0) {
         /* 本页还有其它观察地址：只摘这个函数，页保持武装 */
         pr_info("pte_hook: stop watching 0x%lx, page still armed (%d addrs left)\n",
@@ -771,9 +985,13 @@ int __nocfi hook_handle_fault(unsigned long far, unsigned long esr,
          */
         for (j = 0; j < rec->n_addrs; j++) {
             if (rec->addrs[j] == far_va) {
-                pr_info("pte_hook: hit fn 0x%lx tgid=%d slot=%d\n",
-                        far_va, cur_pid, i);
-                // dump_user_args(uregs, far_va);
+                /* 已有 BRK 探针的地址由 ghost 内的探针负责 dump，
+                 * 这里跳过避免重复打印 */
+                if (!slot_has_probe(rec, (far_va - far_page) >> 2)) {
+                    pr_info("pte_hook: hit fn 0x%lx tgid=%d slot=%d\n",
+                            far_va, cur_pid, i);
+                    dump_user_args(uregs, far_va);
+                }
                 break;
             }
         }
@@ -782,12 +1000,74 @@ int __nocfi hook_handle_fault(unsigned long far, unsigned long esr,
                     (unsigned long)rec->ghost.offsets[idx] * 4;
 
         /* 调试（限幅）：确认重定向真的发生了，以及 ghost PC 是否落在合理范围 */
-        if (rec->dbg_cnt < FAULT_DEBUG_MAX) {
-            rec->dbg_cnt++;
-            pr_info("pte_hook: redirect far=0x%lx -> ghost_pc=0x%lx (slot=%d idx=%u)\n",
-                    far_va, uregs->pc, i, idx);
-        }
+        // if (rec->dbg_cnt < FAULT_DEBUG_MAX) {
+        //     rec->dbg_cnt++;
+        //     pr_info("pte_hook: redirect far=0x%lx -> ghost_pc=0x%lx (slot=%d idx=%u)\n",
+        //             far_va, uregs->pc, i, idx);
+        // }
         return 1;
+    }
+    return 0;
+}
+
+/*
+ * 用户态 BRK 钩子回调（main.c 经 register_user_break_hook 注册）。
+ * 处理 ghost 页内 BRK 探针：dump 观察点的完整寄存器现场，
+ * 然后把 pc 改到清扫槽（被覆盖指令的重生成副本 + 跳回正常后继）。
+ * 返回 1：已接管（调用方返回 DBG_HOOK_HANDLED，目标进程不会收 SIGTRAP）
+ * 返回 0：与本 hook 无关
+ *
+ * 本路径只会被用户态 BRK 指令异常触发（EC=0x3C），
+ * 且内核已按 imm/mask 匹配过魔数；此时 uregs->pc = BRK 指令本身的地址。
+ */
+int __nocfi hook_handle_brk(struct pt_regs *uregs, unsigned int esr)
+{
+    unsigned int iss = esr & 0xFFFF;
+    unsigned long far;
+    int cur_pid;
+    int i, j;
+
+    /* 双保险：imm16 必须带我们的魔数（内核已按 imm/mask 匹配过一遍） */
+    if ((iss & 0xFF00U) != BRK_MAGIC)
+        return 0;
+    if (!uregs)
+        return 0;
+
+    far = uregs->pc;            /* BRK 异常的 ELR = BRK 指令本身的地址 */
+    cur_pid = task_tgid_nr(current);
+
+    for (i = 0; i < MAX_RECORD; i++) {
+        struct hook_record *rec = &g_recs[i];
+        unsigned int g;
+
+        if (!rec->armed)
+            continue;
+        smp_rmb();              /* 与安装侧的 smp_wmb 配对 */
+        if (rec->pid != cur_pid)
+            continue;
+        if (current->mm != rec->ghost.mm)
+            continue;
+        if (far < rec->ghost.vaddr ||
+            far >= rec->ghost.vaddr + (unsigned long)rec->ghost_words * 4)
+            continue;
+
+        g = (unsigned int)((far - rec->ghost.vaddr) >> 2);
+        for (j = 0; j < HOOK_ADDRS_PER_PAGE; j++) {
+            struct brk_probe *p = &rec->probes[j];
+
+            if (p->used && p->ghost_idx == g) {
+                unsigned long orig_va =
+                    rec->target_page + (unsigned long)p->idx * 4;
+
+                // pr_info("pte_hook: watch hit orig=0x%lx (ghost off 0x%x) "
+                //         "tgid=%d slot=%d\n", orig_va, g * 4, cur_pid, i);
+                dump_user_args(uregs, far);
+                /* 去清扫槽执行被覆盖的原指令，随后自动跳回正常后继 */
+                uregs->pc = rec->ghost.vaddr + (unsigned long)p->cleanup_idx * 4;
+                return 1;
+            }
+        }
+        return 0;   /* 在我们 ghost 范围内但不是探针：不接管（不应发生） */
     }
     return 0;
 }

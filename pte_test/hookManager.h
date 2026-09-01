@@ -61,4 +61,20 @@ struct pt_regs;
 int hook_handle_fault(unsigned long far, unsigned long esr,
                       struct pt_regs *uregs);
 
+/*
+ * 用户态 BRK 钩子回调（main.c 经 register_user_break_hook 注册）。
+ * 处理 ghost 页内 BRK 探针：dump 观察点寄存器现场，pc 改到清扫槽。
+ * uregs 直接是用户态寄存器快照，且 uregs->pc = BRK 指令本身的地址。
+ * 返回 1：已接管；返回 0：与本 hook 无关
+ */
+struct pt_regs;
+int hook_handle_brk(struct pt_regs *uregs, unsigned int esr);
+
+/*
+ * BRK 探针总开关：main.c 在 do_debug_exception kprobe 注册成功后置 1。
+ * 未启用时安装路径不会打 BRK 探针（否则 BRK 触发无人接管，
+ * 目标进程会收 SIGTRAP 崩掉），退化为"页入口 dump"。
+ */
+void hook_manager_brk_enable(int enabled);
+
 #endif /* HOOK_MANAGER_H */

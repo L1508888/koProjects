@@ -40,6 +40,9 @@ struct dbi_page_ctx {
     struct dbi_pending_branch pending[DBI_MAX_PENDING_BRANCHES];
     int       n_pending;        /* pending 队列中已记录的条数 */
 
+    int       finalized;        /* 主循环结束标志：置 1 后前向页内分支直接计算 */
+    int       trailer_idx;      /* 页尾收尾跳转（B 回下一页）在 ghost 中的字索引 */
+
     /* 统计计数器 */
     int fixed;              /* 直接修正偏移成功的 */
     int expanded;           /* 被展开成多条指令的 */
@@ -63,6 +66,22 @@ int dbi_patch_ghost(struct dbi_page_ctx *ctx,
 /* 原页 PC → ghost 页 PC 换算 */
 uint64_t dbi_target_to_ghost_pc(const struct dbi_page_ctx *ctx,
                                 uint64_t target_pc);
+
+/*
+ * 在 ghost 当前末尾重新生成原页第 idx 条指令（位置相关修正按新位置计算）。
+ * 用于 BRK 探针的清扫槽。要求 ctx->finalized=1（offset_map 已完整）。
+ * 失败返回 -1 并回滚。
+ */
+int dbi_emit_relocated_insn(struct dbi_page_ctx *ctx, int idx);
+
+/*
+ * BRK 探针打点：在 ghost 末尾生成第 idx 条指令的清扫槽（重生成 + 跳回
+ * 正常后继），并把原位置覆盖为 brk_insn。成功返回清扫槽字索引，失败 -1。
+ */
+int dbi_emit_brk_probe(struct dbi_page_ctx *ctx, int idx, uint32_t brk_insn);
+
+/* 拆除 BRK 探针：把 BRK 位置恢复为原始展开序列。成功 0，失败 -1。 */
+int dbi_remove_brk_probe(struct dbi_page_ctx *ctx, int idx);
                                 
                                 
 
