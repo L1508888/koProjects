@@ -42,7 +42,7 @@ MODULE_LICENSE("GPL");
 
 #define PR_BASE_ID      0x05200000
 #define PR_REGIS_HW_BP  (PR_BASE_ID + 1)
-#define MY_SIG          36
+#define MY_SIG          44
 
 /* 用户态传进来的请求。语义：
  *   - address != 0：在所有 CPU 上装一个 X 型硬件断点；

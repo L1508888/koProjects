@@ -1,0 +1,20 @@
+pcapng: /data/local/tmp/taobao_ecapture.pcapng (linktype=RAW, snaplen=2048)
+keylog file: /data/local/tmp/taobao_ecapture.keylog
+stats: hits=424 pushed=49872 dropped=0 copy_fail=0
+       filtered=5 read_empty=0 pending_miss=0 pending=0/256
+       keylog_hits=424 keylog_bad=0
+       pkt_seen=51119 pkt_pushed=49453 pkt_skipped=1666
+       keylog written=419 skipped=0 (skipped 通常意味着 client_random 偏移不适用)
+       pcapng blocks=49874 bytes=45987392
+parsing /apex/com.android.conscrypt/lib64/libssl.so ...
+found _ZN4bssl14ssl_log_secretEPK6ssl_stPKcNS_4SpanIKhEE (keylog) at file offset 0x3ecd0  [via debugdata]
+target insn @0x3ecd0 = 0xd10203ff
+instruction looks probeable
+using explicit keylog offset 0x39f0c in /data/app/~~Cqj5Gaby0kej9BY7wBsdhw==/com.taobao.taobao-oCtYoHI9vNLfxFgQGC6rFg==/lib/arm64/libtb_ssl.so
+target insn @0x39f0c = 0xd10203ff
+instruction looks probeable
+filter: tgid=0 uid=10257
+extra keylog probe installed: /data/app/~~Cqj5Gaby0kej9BY7wBsdhw==/com.taobao.taobao-oCtYoHI9vNLfxFgQGC6rFg==/lib/arm64/libtb_ssl.so @0x39f0c
+netfilter capture enabled (port=443)
+probes installed (keylog). waiting ... (Ctrl-C to stop)
+stopped.

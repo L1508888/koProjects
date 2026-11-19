@@ -250,6 +250,13 @@ int __nocfi ghost_alloc(struct task_struct *task, struct mm_struct *mm,
         new_pte &= ~PTE_UXN;
         /* 清除 GP（Guarded Page）位：避免 BTI 检查拦截非落地垫跳转 */
         new_pte &= ~(1UL << 50);
+        /*
+         * 清除 CONT（紧邻块）位：属性模板取自 .text 页，那里通常整块
+         * 16 项都置了 CONT。ghost 是孤立一页，若带着 CONT 位就会被
+         * 硬件当成 64KB 连续块的一部分，而相邻项并不是同一块物理内存，
+         * 属于架构未定义行为（实测可能 TLB conflict 或随机取指错误）。
+         */
+        new_pte &= ~PTE_CONT;
 
         ictx.pte_val = new_pte;
         ictx.written = 0;

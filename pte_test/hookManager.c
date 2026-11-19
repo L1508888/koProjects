@@ -100,6 +100,15 @@ struct hook_record {
 
     int             n_addrs;        /* 本页观察的函数入口数 */
     unsigned long   addrs[HOOK_ADDRS_PER_PAGE]; //	一页内会包含很多个函数，同一个页内被hook 的函数地址，这里记录的是原始函数的地址
+    /*
+     * 与 addrs[] 一一对应的"替换目标"（Java 层 hook 用）：
+     *   0    —— 传统观察语义：命中该地址时正常重定向到 ghost 副本
+     *            （原函数照常执行），仅额外 dump 一次参数；
+     *   非 0 —— 替换语义：精确命中该地址的取指异常直接把 pc 改成
+     *            这个地址（用户态 trampoline），本页其它地址仍走 ghost。
+     * 详见 docs/JavaHook.md。
+     */
+    unsigned long   repl[HOOK_ADDRS_PER_PAGE];
     int             dbg_cnt;        /* 本槽位重定向日志限幅计数 */
 
     int             ghost_words;    /* ghost 已写入总字数（含收尾跳转与清扫槽） */
@@ -135,6 +144,17 @@ static follow_pte_t     g_follow_pte;
 static copy_from_user_nofault_t g_copy_from_user;
 static struct workqueue_struct *bp_wq;
 
+/*
+ * 槽位表的全局串行化锁（进程上下文）。
+ *
+ * 两条安装/卸载入口会并发进入：
+ *   1) prctl 命令通道 → workqueue（kworker 进程上下文）；
+ *   2) javahook.c 的同步接口（调用者本身就在进程上下文）。
+ * 槽位查找/占用/拆除本身不是原子的，必须互斥。
+ * fault 路径（kprobe 原子上下文）绝不拿这把锁，只靠 armed 标志同步。
+ */
+static DEFINE_MUTEX(g_install_lock);
+
 /* 重定向调试日志限幅（定位完问题可关） */
 #define FAULT_DEBUG_MAX 32
 
@@ -147,6 +167,111 @@ void hook_manager_init(follow_pte_t follow, copy_from_user_nofault_t copy)
 /* 真正的安装/卸载逻辑（后面定义），先声明给 work 回调用 */
 static void do_install(HookTask *task);
 static void do_uninstall(HookTask *task);
+static int  __do_install(pid_t pid, unsigned long address, unsigned long repl,
+                         int probe);
+static int  __do_uninstall(pid_t pid, unsigned long address);
+static struct hook_record *find_slot_by_page(pid_t pid, unsigned long page);
+static inline unsigned long strip_user_tag(unsigned long addr);
+
+/* ======================================================================
+ * 同步接口（供 javahook.c 等进程上下文调用者使用）
+ * ====================================================================== */
+
+int __nocfi hook_install_sync(pid_t pid, unsigned long address,
+                              unsigned long repl)
+{
+    return hook_install_sync_ex(pid, address, repl, repl == 0);
+}
+
+/*
+ * probe=0 时不给该地址打 BRK 探针。Java 层 UXN 策略的第一步需要这个：
+ * 它只是临时以"观察"方式武装页面以取得 ghost 副本地址，随后立刻把
+ * 同一个地址升级为替换语义。若此时在 ghost 的入口位置打了 BRK，
+ * 之后每次走 backup（ghost 副本入口）都会多一次无谓的异常。
+ */
+int __nocfi hook_install_sync_ex(pid_t pid, unsigned long address,
+                                 unsigned long repl, int probe)
+{
+    int ret;
+
+    mutex_lock(&g_install_lock);
+    ret = __do_install(pid, address, repl, probe);
+    mutex_unlock(&g_install_lock);
+    return ret;
+}
+
+int __nocfi hook_uninstall_sync(pid_t pid, unsigned long address)
+{
+    int ret;
+
+    mutex_lock(&g_install_lock);
+    ret = __do_uninstall(pid, address);
+    mutex_unlock(&g_install_lock);
+    return ret;
+}
+
+int hook_is_watched(pid_t pid, unsigned long address)
+{
+    unsigned long va = strip_user_tag(address);
+    struct hook_record *rec;
+    int i;
+
+    mutex_lock(&g_install_lock);
+    rec = find_slot_by_page(pid, va & PAGE_MASK);
+    if (rec) {
+        for (i = 0; i < rec->n_addrs; i++) {
+            if (rec->addrs[i] == va) {
+                mutex_unlock(&g_install_lock);
+                return 1;
+            }
+        }
+    }
+    mutex_unlock(&g_install_lock);
+    return 0;
+}
+
+/*
+ * 查 ghost 副本地址：给 Java 层 backup（"调用原方法"）用。
+ * 直接跳到重编译副本不会再触发 UXN 异常，从而执行原始逻辑。
+ */
+unsigned long hook_lookup_ghost_pc(pid_t pid, unsigned long address)
+{
+    unsigned long va = strip_user_tag(address);
+    struct hook_record *rec;
+    unsigned long pc = 0;
+    unsigned int idx;
+
+    mutex_lock(&g_install_lock);
+    rec = find_slot_by_page(pid, va & PAGE_MASK);
+    if (rec && rec->armed) {
+        idx = (unsigned int)((va - rec->target_page) >> 2);
+        if (idx < DBI_TARGET_INSNS)
+            pc = rec->ghost.vaddr +
+                 (unsigned long)rec->ghost.offsets[idx] * 4;
+    }
+    mutex_unlock(&g_install_lock);
+    return pc;
+}
+
+/*
+ * 该地址所在页是否已被本模块 UXN 武装。
+ *
+ * 只认 armed==true 的槽位：拆除中途（armed 已清、PTE 可能还没恢复）
+ * 不能报告"仍可执行"，否则 javahook 的入口检查会误判。
+ */
+int hook_page_armed(pid_t pid, unsigned long address)
+{
+    unsigned long va = strip_user_tag(address);
+    struct hook_record *rec;
+    int armed = 0;
+
+    mutex_lock(&g_install_lock);
+    rec = find_slot_by_page(pid, va & PAGE_MASK);
+    if (rec)
+        armed = rec->armed ? 1 : 0;
+    mutex_unlock(&g_install_lock);
+    return armed;
+}
 
 /* ---------- 工作队列：原子上下文登记 → 进程上下文执行 ---------- */
 
@@ -173,10 +298,17 @@ static void bp_work_fn(struct work_struct *work)
 {
     struct bp_request *req = container_of(work, struct bp_request, work);
 
+    /*
+     * 槽位表也要和 javahook 的同步接口互斥：两条路径都会改槽位
+     * （查找/占用/拆除），并发进入会破坏槽位一致性。
+     * kworker 是进程上下文，可以安全地拿 mutex。
+     */
+    mutex_lock(&g_install_lock);
     if (req->op == BP_OP_INSTALL)
         do_install(&req->t);
     else if (req->op == BP_OP_UNINSTALL)
         do_uninstall(req->has_task ? &req->t : NULL);
+    mutex_unlock(&g_install_lock);
 
     kfree(req);
 }
@@ -251,7 +383,14 @@ static inline pte_t pte_clear_uxn(pte_t pte)
     return pte;
 }
 
-/* 根据 pid 找 task_struct（增加引用计数，用毕需 put_task_struct） */
+/*
+ * 根据 pid 找 task_struct（增加引用计数，用毕需 put_task_struct）。
+ *
+ * find_task_by_vpid 只查"当前调用者所在 pid namespace"里的编号，
+ * 当命令进程处于不同 namespace（容器 / KernelSU 的 su）时会返回 NULL，
+ * 尽管 /proc/<pid> 可访问。这里加一层全局 tgid 扫描兜底，
+ * 与用户态 ps / /proc 的编号语义保持一致（见 javahook.c 的同名函数）。
+ */
 static struct task_struct *get_task_by_pid(pid_t pid)
 {
     struct task_struct *task = NULL;
@@ -261,7 +400,20 @@ static struct task_struct *get_task_by_pid(pid_t pid)
     if (task)
         get_task_struct(task);
     rcu_read_unlock();
-    return task;
+
+    if (task)
+        return task;
+
+    rcu_read_lock();
+    for_each_process(task) {
+        if (task_tgid_nr(task) == pid) {
+            get_task_struct(task);
+            rcu_read_unlock();
+            return task;
+        }
+    }
+    rcu_read_unlock();
+    return NULL;
 }
 
 /*
@@ -429,19 +581,25 @@ static struct hook_record *find_free_slot(void)
 }
 
 /* 观察表中记录的就是真实地址，而且页基址是相同的，先进行记录。返回 1=新增，0=已存在或已满 */
-static int slot_add_watch_addr(struct hook_record *rec, unsigned long va)
+static int slot_add_watch_addr(struct hook_record *rec, unsigned long va,
+                               unsigned long repl)
 {
     int i;
 
     for (i = 0; i < rec->n_addrs; i++)
-        if (rec->addrs[i] == va)
-            return 0;                   /* 已存在 */
+        if (rec->addrs[i] == va) {
+            /* 已存在：只更新替换目标（可在"观察/替换"之间切换） */
+            rec->repl[i] = repl;
+            return 0;
+        }
     if (rec->n_addrs >= HOOK_ADDRS_PER_PAGE) {
         pr_warn("pte_hook: watch addrs full on page 0x%lx\n",
                 rec->target_page);
         return 0;
     }
-    rec->addrs[rec->n_addrs++] = va;
+    rec->addrs[rec->n_addrs] = va;
+    rec->repl[rec->n_addrs] = repl;
+    rec->n_addrs++;
     return 1;
 }
 
@@ -453,6 +611,7 @@ static void slot_remove_watch_addr(struct hook_record *rec, unsigned long va)
     for (i = 0; i < rec->n_addrs; i++) {
         if (rec->addrs[i] == va) {
             rec->addrs[i] = rec->addrs[rec->n_addrs - 1];
+            rec->repl[i]  = rec->repl[rec->n_addrs - 1];
             rec->n_addrs--;
             return;
         }
@@ -556,19 +715,21 @@ static int slot_probe_emit(struct hook_record *rec, struct dbi_page_ctx *ctx,
 }
 
 /* 运行时给已武装的槽位追加观察地址 + 打 BRK 探针（kworker 进程上下文） */
-static void __nocfi slot_watch_add(struct hook_record *rec, unsigned long va)
+static void __nocfi slot_watch_add(struct hook_record *rec, unsigned long va,
+                                   unsigned long repl, int probe)
 {
     uint32_t *buf;
     struct dbi_page_ctx *ctx;
 
-    if (!slot_add_watch_addr(rec, va)) {
+    if (!slot_add_watch_addr(rec, va, repl)) {
         pr_info("pte_hook: 0x%lx already watched (or watch list full)\n", va);
         return;
     }
     pr_info("pte_hook: reuse slot, watch 0x%lx (page 0x%lx already armed)\n",
             va, rec->target_page);
 
-    if (!g_brk_enabled)
+    /* probe=0 或 BRK 钩子没就位：只登记地址，不动 ghost */
+    if (!probe || !g_brk_enabled)
         return;
 
     buf = kvzalloc(DBI_GHOST_MAX_BYTES, GFP_KERNEL);
@@ -706,11 +867,18 @@ static void reap_dead_slots(void)
  * 真正的安装逻辑（仅由 bp_work_fn 在进程上下文调用，可以睡眠）。
  * 注意任何出错路径都要把已拿到的资源（task 引用、mm 引用、
  * 缓冲区、ghost 页）全部释放，否则泄漏。
+ *
+ * repl 语义见 hookManager.h / docs/JavaHook.md：
+ *   0    = 观察模式（重定向进 ghost，原函数照常执行）
+ *   非 0 = 替换模式（精确命中该地址时直接跳到 repl）
+ *
+ * 返回 0 成功，负值为 -errno。调用方需持有 g_install_lock。
  */
-static void __nocfi do_install(HookTask *task)
+static int __nocfi __do_install(pid_t pid, unsigned long address,
+                                unsigned long repl, int probe)
 {
-    struct task_struct *target;
-    struct mm_struct *mm;
+    struct task_struct *target = NULL;
+    struct mm_struct *mm = NULL;
     unsigned long va, page;
     uint32_t *orig = NULL, *ghost_code = NULL;
     struct dbi_page_ctx *ctx = NULL;
@@ -719,9 +887,9 @@ static void __nocfi do_install(HookTask *task)
     int ret = 0, i;
 
     if (!g_follow_pte)
-        return;
+        return -ENODEV;
 
-    va   = strip_user_tag(task->address);
+    va   = strip_user_tag(address);
     page = va & PAGE_MASK;
 
     /* 0. 顺手收割目标进程已退出的槽位，避免槽位和物理页泄漏 */
@@ -730,34 +898,35 @@ static void __nocfi do_install(HookTask *task)
     /*
      * 同一个进程，而且页基址还相同，那么就可以复用之前的东西，否则卸载的时候会出现问题。
      */
-    rec = find_slot_by_page(task->pid, page);
+    rec = find_slot_by_page(pid, page);
     if (rec) {
         /* 同页复用：登记观察地址并补打 BRK 探针（实时改 ghost + 刷 i-cache） */
-        slot_watch_add(rec, va);
-        return;
+        slot_watch_add(rec, va, repl, probe);
+        return 0;
     }
 
     /* 2. 新页：找空槽位 */
     rec = find_free_slot();
     if (!rec) {
         pr_warn("pte_hook: no free slot (max %d)\n", MAX_RECORD);
-        return;
+        return -ENOSPC;
     }
     /* 防御：清掉可能残留的上次安装痕迹（失败回滚路径可能留下探针标记） */
     memset(rec->probes, 0, sizeof(rec->probes));
+    memset(rec->repl, 0, sizeof(rec->repl));
     rec->ghost_words = 0;
     rec->trailer_idx = -1;
 
-    target = get_task_by_pid(task->pid);
+    target = get_task_by_pid(pid);
     if (!target) {
-        pr_err("pte_hook: can't find task %d\n", task->pid);
-        return;
+        pr_err("pte_hook: can't find task %d\n", pid);
+        return -ESRCH;
     }
     mm = get_task_mm(target);
     if (!mm) {
         put_task_struct(target);
-        pr_err("pte_hook: task %d don't have mm\n", task->pid);
-        return;
+        pr_err("pte_hook: task %d don't have mm\n", pid);
+        return -ESRCH;
     }
 
     orig = kmalloc(PAGE_SIZE, GFP_KERNEL);
@@ -817,8 +986,10 @@ static void __nocfi do_install(HookTask *task)
     }
 
     /* 3.5 给观察地址打 BRK 探针：执行流路过 ghost 内该位置时陷入内核
-     *    dump 寄存器。失败只降级为"页入口 dump"，不影响安装。 */
-    if (slot_probe_emit(rec, ctx, va))
+     *    dump 寄存器。失败只降级为"页入口 dump"，不影响安装。
+     *    替换模式（Java hook）下该地址的执行流根本不进 ghost，
+     *    打探针毫无意义还会多一次异常；probe=0 表示调用方明确不要。 */
+    if (probe && !repl && slot_probe_emit(rec, ctx, va))
         pr_warn("pte_hook: brk probe unavailable for 0x%lx, entry-dump only\n",
                 va);
 
@@ -854,9 +1025,10 @@ static void __nocfi do_install(HookTask *task)
      *    hook_handle_fault 因 armed==false 直接返回 0，原 do_mem_abort
      *    就会对 UXN 页发 SIGSEGV 杀掉目标进程。此时 ghost 页已就绪，
      *    提前武装是安全的：UXN 未设前目标页不会 fault，不会误接管。 */
-    rec->pid         = task->pid;
+    rec->pid         = pid;
     rec->target_page = page;
     rec->addrs[0]    = va;
+    rec->repl[0]     = repl;
     rec->n_addrs     = 1;
     rec->dbg_cnt     = 0;
     rec->used        = 1;
@@ -884,27 +1056,28 @@ out_free:
     kfree(orig);
     put_task_struct(target);
     mmput(mm);
+    return ret;
+}
+
+/* 观察模式安装（prctl 命令通道用，异步执行） */
+static void __nocfi do_install(HookTask *task)
+{
+    __do_install(task->pid, task->address, 0, 1);
 }
 
 /* 卸载：task 非 NULL 卸指定 (pid,address)，NULL 卸全部（进程上下文） */
-static void __nocfi do_uninstall(HookTask *task)
+static int __nocfi __do_uninstall(pid_t pid, unsigned long address)
 {
     unsigned long va, page;
     struct hook_record *rec;
 
-    if (!task) {
-        uninstall_all_hooks();
-        return;
-    }
-
-    va   = strip_user_tag(task->address);
+    va   = strip_user_tag(address);
     page = va & PAGE_MASK;
 
-    rec = find_slot_by_page(task->pid, page);
+    rec = find_slot_by_page(pid, page);
     if (!rec) {
-        pr_warn("pte_hook: uninstall: no hook for pid=%d addr=0x%lx\n",
-                task->pid, va);
-        return;
+        /* 幂等：已经不在表里就当作成功，避免上层反复重试 */
+        return 0;
     }
 
     slot_remove_watch_addr(rec, va);
@@ -913,12 +1086,21 @@ static void __nocfi do_uninstall(HookTask *task)
         /* 本页还有其它观察地址：只摘这个函数，页保持武装 */
         pr_info("pte_hook: stop watching 0x%lx, page still armed (%d addrs left)\n",
                 va, rec->n_addrs);
-        return;
+        return 0;
     }
 
     /* 本页没有观察对象了：整页拆除（恢复 PTE、释放 ghost） */
     slot_teardown(rec);
     pr_info("pte_hook: uninstall 0x%lx done\n", va);
+    return 0;
+}
+
+static void __nocfi do_uninstall(HookTask *task)
+{
+    if (!task)
+        uninstall_all_hooks();
+    else
+        __do_uninstall(task->pid, task->address);
 }
 
 void __nocfi uninstall_all_hooks(void)
@@ -981,19 +1163,28 @@ int __nocfi hook_handle_fault(unsigned long far, unsigned long esr,
          * UXN 以页为单位：目标页内任何地址 fault 都重定向到 ghost 页
          * 的对应位置。这正好解决了"同页其它函数先执行导致 hook 失效"
          * 的老问题——整页的执行都被搬到了 ghost 页。
-         * 只有精确命中登记的函数入口时，x0..x7 才是该函数的入参。
+         *
+         * 如果该地址登记了替换目标（Java 层 hook），精确命中时直接跳到
+         * 替换函数（用户态 trampoline），不再进入 ghost 副本；替换函数
+         * 想"调用原方法"时跳到 hook_lookup_ghost_pc() 给出的副本地址即可。
          */
         for (j = 0; j < rec->n_addrs; j++) {
-            if (rec->addrs[j] == far_va) {
-                /* 已有 BRK 探针的地址由 ghost 内的探针负责 dump，
-                 * 这里跳过避免重复打印 */
-                if (!slot_has_probe(rec, (far_va - far_page) >> 2)) {
-                    pr_info("pte_hook: hit fn 0x%lx tgid=%d slot=%d\n",
-                            far_va, cur_pid, i);
-                    dump_user_args(uregs, far_va);
-                }
-                break;
+            if (rec->addrs[j] != far_va)
+                continue;
+
+            if (rec->repl[j]) {
+                uregs->pc = rec->repl[j];
+                return 1;
             }
+
+            /* 观察语义：已有 BRK 探针的地址由 ghost 内的探针负责 dump，
+             * 这里跳过避免重复打印 */
+            if (!slot_has_probe(rec, idx)) {
+                pr_info("pte_hook: hit fn 0x%lx tgid=%d slot=%d\n",
+                        far_va, cur_pid, i);
+                dump_user_args(uregs, far_va);
+            }
+            break;
         }
 
         uregs->pc = rec->ghost.vaddr +
@@ -1056,11 +1247,10 @@ int __nocfi hook_handle_brk(struct pt_regs *uregs, unsigned int esr)
             struct brk_probe *p = &rec->probes[j];
 
             if (p->used && p->ghost_idx == g) {
-                unsigned long orig_va =
+                /* 观察点的原页地址（排查用，日志打开时需要） */
+                unsigned long __maybe_unused orig_va =
                     rec->target_page + (unsigned long)p->idx * 4;
 
-                // pr_info("pte_hook: watch hit orig=0x%lx (ghost off 0x%x) "
-                //         "tgid=%d slot=%d\n", orig_va, g * 4, cur_pid, i);
                 dump_user_args(uregs, far);
                 /* 去清扫槽执行被覆盖的原指令，随后自动跳回正常后继 */
                 uregs->pc = rec->ghost.vaddr + (unsigned long)p->cleanup_idx * 4;

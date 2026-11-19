@@ -7,7 +7,6 @@
 #include "ghost.h"
 
 
-
 /* hook 请求（内部传递用；用户态 ABI 见 main.c 头部注释） */
 typedef struct {
     unsigned long address;   /* 目标函数的精确地址（不要求页对齐） */
@@ -71,10 +70,62 @@ struct pt_regs;
 int hook_handle_brk(struct pt_regs *uregs, unsigned int esr);
 
 /*
- * BRK 探针总开关：main.c 在 do_debug_exception kprobe 注册成功后置 1。
+ * BRK 探针总开关：main.c 在 register_user_break_hook 注册成功后置 1。
  * 未启用时安装路径不会打 BRK 探针（否则 BRK 触发无人接管，
  * 目标进程会收 SIGTRAP 崩掉），退化为"页入口 dump"。
  */
 void hook_manager_brk_enable(int enabled);
+
+/* ======================================================================
+ * 扩展接口（Java 层 hook 用，见 javahook.c / docs/JavaHook.md）
+ * ====================================================================== */
+
+/*
+ * 同步安装：给 (pid, address) 安装 hook。
+ *
+ * replace 语义：
+ *   0  —— 传统"观察"语义：页被 UXN 武装后，任何地址的取指异常都
+ *         重定向到 ghost 里对应的重编译副本，原函数照常执行；
+ *         精确命中 address 时额外 dump 一次参数。
+ *   非 0 —— "替换"语义：只有精确命中 address 的取指异常会把用户态
+ *          pc 直接改成 replace（Java 层 trampoline），该页其它地址
+ *          （以及经 ghost 内部跳转回到本页的流程）仍走 ghost 副本。
+ *
+ * 仅可在进程上下文调用（内部会申请内存、拿 mmap 锁、可能睡眠）。
+ * 返回 0 表示成功，负值为 -errno。
+ */
+int  hook_install_sync(pid_t pid, unsigned long address, unsigned long replace);
+
+/*
+ * 同上，但可控制是否给该地址打 ghost 内 BRK 探针（probe=0 关闭）。
+ * Java 层 UXN 策略的第一步用它：以"观察"方式武装页面取得 ghost 副本
+ * 地址，之后再升级成替换语义，期间不需要探针。
+ */
+int  hook_install_sync_ex(pid_t pid, unsigned long address,
+                          unsigned long replace, int probe);
+
+/*
+ * 同步卸载指定地址（进程上下文）。若该页还有其它地址，只摘除这个地址，
+ * 页保持武装；地址表空了才整页拆除（恢复 PTE、释放 ghost）。
+ */
+int  hook_uninstall_sync(pid_t pid, unsigned long address);
+
+/*
+ * 查询目标地址在 ghost 中的重编译副本 PC。
+ * Java 层 strategy-B（UXN 替换）把"调用原方法"的 backup 指向这里：
+ * 直接跳到 ghost 副本不会再次触发 UXN 异常，从而执行原始逻辑。
+ * 未安装 / 该页未武装时返回 0。
+ */
+unsigned long hook_lookup_ghost_pc(pid_t pid, unsigned long address);
+
+/* 目标地址是否已被登记（任一槽位的地址表里） */
+int  hook_is_watched(pid_t pid, unsigned long address);
+
+/*
+ * 目标地址所在页是否已被本模块 UXN 武装（同一页的其它函数入口）。
+ * Java 层判断"入口是否可执行"时要用它：已被武装的页 UXN 位是置位的，
+ * 单看 PTE 会误判为"不可执行"，但实际上取指异常会被我们接管。
+ */
+int  hook_page_armed(pid_t pid, unsigned long address);
 
 #endif /* HOOK_MANAGER_H */

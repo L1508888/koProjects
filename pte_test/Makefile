@@ -11,8 +11,9 @@ MOR := /home/liuxin/pixelKernel/out/android13-5.10/common
 obj-m := pte_main.o
 
 # 组成 pte_test.ko 的各个 .o（可继续追加）
-pte_main-objs :=  main.o hookManager.o dbi.o ghost.o callback.o
+pte_main-objs :=  main.o hookManager.o dbi.o ghost.o callback.o javahook.o jh_tramp.o
 
+# -mgeneral-regs-only：内核模块不能用 FP/SIMD 寄存器（中断上下文不保存它们）
 ccflags-y=-mgeneral-regs-only
 
 modules:
